@@ -1,0 +1,33 @@
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -51,6 +51,20 @@
+ /// The size of a pooled block, at most the device's `maxMemoryAllocationSize`.
+ pub(super) const BLOCK_BYTES: u64 = 64 << 20;
+ 
++/// [`BLOCK_BYTES`], or `M2V_BLOCK_MIB` mebibytes (a power of two from 1 to 64): a GPU whose memory
++/// is one fixed pool that every process's device shares (a virtual machine's) fits more devices in
++/// smaller blocks, a process's pools and the room it keeps in them each taking one.
++fn block_bytes() -> u64 {
++    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *BYTES.get_or_init(|| {
++        std::env::var("M2V_BLOCK_MIB")
++            .ok()
++            .and_then(|mib| mib.parse::<u64>().ok())
++            .filter(|mib| mib.is_power_of_two() && *mib <= 64)
++            .map_or(BLOCK_BYTES, |mib| mib << 20)
++    })
++}
++
+ /// What memory a resource needs.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub(super) enum MemoryClass {
+@@ -689,7 +703,7 @@
+                 .map(|_| Pool::default())
+                 .collect(),
+             types,
+-            block_bytes: BLOCK_BYTES.min(max_allocation.max(1)),
++            block_bytes: block_bytes().min(max_allocation.max(1)),
+             device_address,
+             address_types: None,
+             kept: None,

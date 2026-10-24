@@ -377,7 +377,10 @@ static void noteProblem(NSString *what) {
  memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
  strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
 }
-#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);}while(0)
+// NMB_LOG_STDERR: also on stderr (a daemon's NSLog reaches only the unified log, which a bring-up board does not read).
+static bool logToStderr() {static bool on=getenv("NMB_LOG_STDERR")!=nullptr;return on;}
+#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);\
+ if(logToStderr())fprintf(stderr,"%s: %.140s\n",getprogname(),nbText.UTF8String?:"?");}while(0)
 // The render server does not get past the loss of its GPU context: CoreAnimation keeps submitting to the dead context and
 // the display shows the surfaces it composed last until backboardd restarts (the hang's evidence is in the host's KGSL log
 // and the context's loss mask, not here). End it once its completed handlers have seen the error; launchd starts it
@@ -3116,6 +3119,18 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NmbHeap *handle=nmb_heap_new(gDevice,d.type,d.size,(uint64_t)d.resourceOptions);
  if(!handle){NBLOG(@"native-metal: heap refused: %@",lastError());return nil;}
  NBHeap *heap=[NBHeap new];heap.handle=handle;heap.options=d.resourceOptions;heap.heapType=d.type;return (id<MTLHeap>)heap;
+}
+// A descriptor the runtime refuses answers {0, 0}, as Metal answers one it makes no texture of.
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d {
+ NmbTextureDescriptor descriptor;uint64_t answer[2]={0,0};
+ if(textureDescriptor(d,&descriptor)&&!nmb_device_heap_texture_size_and_align(gDevice,&descriptor,answer))
+  NBLOG(@"native-metal: heap texture size refused: %@",lastError());
+ return (MTLSizeAndAlign){answer[0],answer[1]};
+}
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+ uint64_t answer[2]={0,0};
+ if(!nmb_device_heap_buffer_size_and_align(gDevice,length,(uint64_t)options,answer))NBLOG(@"native-metal: heap buffer size refused: %@",lastError());
+ return (MTLSizeAndAlign){answer[0],answer[1]};
 }
 - (id)newResourceGroupFromResources:(const id __unsafe_unretained [])resources count:(NSUInteger)count {
  NBResourceGroup *group=[NBResourceGroup new];

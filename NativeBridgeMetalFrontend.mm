@@ -73,7 +73,8 @@ static void abortProbe(int signal, siginfo_t *si, void *context) {
  (void)!write(2, line, (size_t)(at - line)); at = line;
  const __darwin_arm_thread_state64 &ss = ((ucontext_t *)context)->uc_mcontext->__ss;
  for (int r = 0; r < 33; ++r) {
-  const uint64_t value = r < 29 ? ss.__x[r] : r == 29 ? ss.__fp : r == 30 ? ss.__lr : r == 31 ? ss.__sp : ss.__pc;
+  const uint64_t value = r < 29 ? ss.__x[r] : r == 29 ? (uint64_t)__darwin_arm_thread_state64_get_fp(ss) : r == 30 ? (uint64_t)__darwin_arm_thread_state64_get_lr(ss) :
+   r == 31 ? (uint64_t)__darwin_arm_thread_state64_get_sp(ss) : (uint64_t)__darwin_arm_thread_state64_get_pc(ss);   // arm64e's are opaque
   at = line; at = probeText(at, "  r"); *at++ = char('0' + r / 10); *at++ = char('0' + r % 10); *at++ = ' ';
   at = probeHex(at, value & 0x0000ffffffffffffull);
   const uint64_t pointer = value & 0x0000ffffffffffffull;
@@ -95,7 +96,7 @@ static void abortProbe(int signal, siginfo_t *si, void *context) {
  const volatile uintptr_t *guard = &__stack_chk_guard;
  for (int i = -4; i <= 4; ++i) {*at++ = ' '; at = probeHex(at, guard[i]);}
  *at++ = '\n'; (void)!write(2, line, (size_t)(at - line));
- uint64_t fp = ((ucontext_t *)context)->uc_mcontext->__ss.__fp;
+ uint64_t fp = (uint64_t)__darwin_arm_thread_state64_get_fp(((ucontext_t *)context)->uc_mcontext->__ss);
  for (int frame = 0; frame < 8 && fp && !(fp & 7); ++frame) {
   if (!probeReadable(fp) || !probeReadable(fp - 96)) break;
   const volatile uint64_t *f = (const volatile uint64_t *)fp;
@@ -3281,6 +3282,10 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
   word(0x62697463 /* 'bitc' */);word((uint32_t)bitcode.length);
   const uint8_t *b=(const uint8_t *)bitcode.bytes;request.insert(request.end(),b,b+bitcode.length);
  }
+ // macOS 27's compiler (MTLCompilerObject::stitchFunctionDag) reads three more tagged slots after the functions, each a tag that
+ // is consumed whether or not it matches, and aborts when the request ends before them: 'nums' and the count of scripts, 'ptfm'
+ // and the platform, 'arid' and the size of an archive id. None of them, as zeros.
+ word(0x6e756d73 /* 'nums' */);word(0);word(0x7074666d /* 'ptfm' */);word(0);word(0x61726964 /* 'arid' */);word(0);
  NSString *warnings=nil,*failure=nil;
  NSData *metallib=codeGenRequest(14,request,&warnings,&failure);
  if(!metallib) {

@@ -2899,14 +2899,23 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 @end
 
 // The device queries the runtime answers (nmb_device_answer_selector), as methods of the device class. One without an argument is read once
-// and installed only where the device has an answer of its own; one with an argument asks the runtime each call, and a refusal answers 0/NO
-// with the reason logged.
+// and installed only where the device has an answer of its own; one with an argument asks the runtime once per argument, and a refusal answers
+// 0/NO with the reason logged. The answers are the device's and do not change, and supportsFamily: alone audits every row of the family's
+// column in Apple's tables: the render server asks it while drawing each layer, and it was a fifth of its display thread in a home-screen drag.
 static std::unordered_map<SEL,uint64_t> gAnswers;
 static NSUInteger countAnswer(id,SEL cmd) {return (NSUInteger)gAnswers.at(cmd);}
 static BOOL flagAnswer(id,SEL cmd) {return gAnswers.at(cmd)!=0;}
+static std::mutex gArgAnswersLock;
+static std::unordered_map<SEL,std::unordered_map<NSUInteger,uint64_t>> gArgAnswers;
 static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
+ {
+  std::lock_guard<std::mutex> lock(gArgAnswersLock);
+  auto known=gArgAnswers.find(cmd);
+  if(known!=gArgAnswers.end()){auto answer=known->second.find(arg);if(answer!=known->second.end())return answer->second;}
+ }
  uint64_t value=0;
- if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());return 0;}
+ if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());value=0;}
+ std::lock_guard<std::mutex> lock(gArgAnswersLock);gArgAnswers[cmd][arg]=value;
  return value;
 }
 static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}

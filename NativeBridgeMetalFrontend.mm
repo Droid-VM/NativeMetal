@@ -2907,14 +2907,17 @@ static NSUInteger countAnswer(id,SEL cmd) {return (NSUInteger)gAnswers.at(cmd);}
 static BOOL flagAnswer(id,SEL cmd) {return gAnswers.at(cmd)!=0;}
 static std::mutex gArgAnswersLock;
 static std::unordered_map<SEL,std::unordered_map<NSUInteger,uint64_t>> gArgAnswers;
+// Diagnostic A/B switch, read when the process starts: ask the runtime on every call again.
+static const bool gNoAnswerCache=access("/private/var/ngpu/debug/no-answer-cache",F_OK)==0;
 static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
- {
+ if(!gNoAnswerCache) {
   std::lock_guard<std::mutex> lock(gArgAnswersLock);
   auto known=gArgAnswers.find(cmd);
   if(known!=gArgAnswers.end()){auto answer=known->second.find(arg);if(answer!=known->second.end())return answer->second;}
  }
  uint64_t value=0;
  if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());value=0;}
+ if(gNoAnswerCache)return value;
  std::lock_guard<std::mutex> lock(gArgAnswersLock);gArgAnswers[cmd][arg]=value;
  return value;
 }

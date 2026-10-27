@@ -697,8 +697,11 @@ NB_RESOURCE_SPI
 // owners keep the mapping live through this phase. Maintain each exact CPU
 // range once; no address identity or decision is carried into another phase
 // or command, and distinct/partially overlapping ranges retain their calls.
+// Diagnostic: while /private/var/ngpu/debug/no-surface-flush exists when the process starts, no surface is flushed here, to
+// measure what the whole-allocation maintenance costs a frame (the host imports guest pages IO-coherent).
+static const bool gSkipSurfaceFlush=access("/private/var/ngpu/debug/no-surface-flush",F_OK)==0;
 static void flushSurfaces(NSMutableSet *surfaces) {
- if(!surfaces.count)return;
+ if(!surfaces.count || gSkipSurfaceFlush)return;
  std::vector<std::pair<uintptr_t,size_t>> ranges;
  ranges.reserve(surfaces.count);
  for(NBTexture *texture in surfaces)if(texture.surface)

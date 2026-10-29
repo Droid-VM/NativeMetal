@@ -329,6 +329,65 @@ pub extern "C" fn nmb_device_texture_counts(device: *const NmbDevice, out: *mut 
     })
 }
 
+/// Where render passes cost the GPU more than Metal's single pass in tile memory, into the caller's ten words: passes begun as
+/// instances, passes split inline, then instance splits for a barrier, tile memory, a memoryless write and a pending pipeline, stand-ins
+/// made and their bytes, and stand-in copies made and those made at draws.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_pass_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's ten words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 10) };
+        let w = get(device)?.0.work_counts();
+        out.copy_from_slice(&[w.render_passes_begun_instances, w.inline_passes_split, w.instance_splits_barrier,
+                              w.instance_splits_tile_memory, w.instance_splits_memoryless_write, w.instance_splits_pending_pipeline,
+                              w.stand_ins_made, w.stand_in_bytes, w.stand_in_copies_made, w.stand_in_copies_made_at_draws]);
+        Ok(true)
+    })
+}
+
+/// Where the runtime's device memory is, into the caller's ten words: bytes of its pooled blocks with a placement and of those the
+/// bytes placed, of its empty kept pooled blocks, of its dedicated blocks (GPU pools, large resources) and of its host imports; then
+/// the bytes it allocated so far, its live pooled and dedicated block counts, and the GPU pool blocks made and released.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_memory_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's ten words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 10) };
+        let w = get(device)?.0.work_counts();
+        out.copy_from_slice(&[w.pooled_memory_bytes_live, w.pooled_memory_bytes_used, w.empty_memory_bytes_live,
+                              w.dedicated_memory_bytes_live, w.imported_memory_bytes_live, w.device_memory_allocated,
+                              w.memory_blocks_live, w.dedicated_memory_blocks_live, w.gpu_pool_blocks_made, w.gpu_pool_blocks_released]);
+        Ok(true)
+    })
+}
+
+/// The call stacks that allocated device memory of 4 MiB or more (bridge patch 0020), most bytes first, into the caller's `max` records
+/// of twelve words: bytes, allocations, then ten return addresses (0 past the stack's end). Returns the records written.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_allocation_sites(out: *mut u64, max: usize) -> usize {
+    if out.is_null() {
+        return 0;
+    }
+    let sites = metal2vulkan_runtime::allocation_sites();
+    let count = sites.len().min(max);
+    // SAFETY: the caller's `max` records of twelve words.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, count * 12) };
+    for (record, site) in out.chunks_mut(12).zip(&sites) {
+        record[0] = site.bytes;
+        record[1] = site.count;
+        for (word, frame) in record[2..].iter_mut().zip(site.frames) {
+            *word = frame as u64;
+        }
+    }
+    count
+}
+
 /// Separate artifact and driver-record counters, mirroring the C ABI.
 #[repr(C)]
 pub struct NmbShaderCacheStats {

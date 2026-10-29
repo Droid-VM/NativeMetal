@@ -20,7 +20,7 @@ use metal2vulkan::pipeline::{
 use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
     ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
-    MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
+    Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
     SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
 use std::cell::RefCell;
@@ -115,6 +115,20 @@ pub extern "C" fn nmb_last_error() -> *const c_char {
     })
 }
 
+/// The GPU scanout's half-float conversion kernel (shaders/scanout_convert.ll), assembled to AIR at build time.
+static SCANOUT_CONVERT_AIR: &[u8] = include_bytes!(env!("NMB_SCANOUT_AIR"));
+
+/// # Safety
+/// `length` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_scanout_convert_air(length: *mut usize) -> *const c_void {
+    // SAFETY: the caller's contract.
+    if let Some(length) = unsafe { length.as_mut() } {
+        *length = SCANOUT_CONVERT_AIR.len();
+    }
+    SCANOUT_CONVERT_AIR.as_ptr() as *const c_void
+}
+
 /// The runtime's kernel_function_constant_gate_fold fixture, assembled to AIR at build time.
 static FUNCTION_CONSTANT_AIR: &[u8] = include_bytes!(env!("NMB_FC_AIR"));
 
@@ -163,16 +177,24 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         let (loader, cache) = unsafe { (CStr::from_ptr(loader), CStr::from_ptr(cache)) };
         let mut options = DeviceOptions::default();
         options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
-        options.metal_level = Some(MetalLevel::NEWEST);
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
-        // A texture over a buffer whose rows lie apart is an image over the bytes, rendered or written too: the window server's padded
-        // framebuffers (3048x2032 BGRA8 at 12288-byte rows, int-251) were otherwise copied in and out of a shadow image every pass.
-        options.policy.padded_reads = metal2vulkan::device::PaddedReadsPolicy::AliasWrites;
+        // A texture over host pages or a buffer whose rows lie apart is an image over the bytes, rendered or written too: the window
+        // server's surfaces and padded framebuffers (3048x2032 BGRA8 at 12288-byte rows, int-251) were otherwise copied in and out of a
+        // shadow image every pass.
+        options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites;
+        // Metal makes a pipeline state's pipeline at its creation and never drops a draw for a pipeline being made; the runtime's
+        // default (PipelineWaitPolicy::Bounded) drops the draws and dispatches of a pipeline not made 4.5 s after the commit, which the
+        // render server showed as missing pieces of the screen while it compiled (int 590aaee2).
+        options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
         // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
         options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
         let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
-        Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::default())))
+        let device = Device::system_default_with(&options).map_err(e("device"))?;
+        // No caller moves or detaches the pages of a no-copy buffer (the frontend has no rebind or detach): the encoders log no calls
+        // to encode again and hold no surface's buffer per command, which every frame of the render server paid for.
+        device.refuse_rebinds();
+        Ok(boxed(NmbDevice(device, std::sync::OnceLock::new(), std::sync::Mutex::default())))
     })
 }
 
@@ -288,9 +310,9 @@ pub extern "C" fn nmb_device_work_stats(device: *const NmbDevice, out: *mut u64)
     })
 }
 
-/// The device's texture copy counts into the caller's eight words: linear images at Metal's row pitch made, refused by the driver and
-/// refused again from memory, textures given a shadow image, shadow copies in and texels copied back, and passes over linear images
-/// rendered in place and through copies.
+/// The device's texture copy counts into the caller's eight words: textures over host pages in place, of them linear images at Metal's
+/// row pitch, host-page textures shadowed for their pitch and for no image the driver makes, textures given a shadow image, shadow
+/// copies in and texels copied back, and host-page textures shadowed as render targets.
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_device_texture_counts(device: *const NmbDevice, out: *mut u64) -> bool {
     guard(false, || {
@@ -300,9 +322,9 @@ pub extern "C" fn nmb_device_texture_counts(device: *const NmbDevice, out: *mut 
         // SAFETY: the header's eight words.
         let out = unsafe { std::slice::from_raw_parts_mut(out, 8) };
         let w = get(device)?.0.work_counts();
-        out.copy_from_slice(&[w.pitched_host_images, w.pitched_host_image_refusals, w.pitched_host_image_refusals_recalled,
-                              w.shadowed_textures, w.shadow_copies, w.shadow_texels_copied_back, w.linear_passes_in_place,
-                              w.linear_passes_through_copies]);
+        out.copy_from_slice(&[w.host_textures_in_place, w.pitched_host_images, w.host_texture_shadows_refused_pitch,
+                              w.host_texture_shadows_refused_image, w.shadowed_textures, w.shadow_copies, w.shadow_texels_copied_back,
+                              w.host_texture_shadows_render_target]);
         Ok(true)
     })
 }
@@ -324,6 +346,34 @@ pub struct NmbShaderCacheStats {
     pub driver_truncated: u64,
     pub driver_mismatched: u64,
     pub driver_unchanged: u64,
+}
+
+/// The caller's read-only source of shader-cache entries behind the cache directory: `read(path, out, length)` gives the entry at
+/// `path` (relative to the directory) in a buffer from malloc (the bridge frees it) and returns true, or returns false.
+type FallbackRead = unsafe extern "C" fn(*const c_char, *mut *mut u8, *mut usize) -> bool;
+static FALLBACK_READ: std::sync::OnceLock<FallbackRead> = std::sync::OnceLock::new();
+
+fn fallback_read(path: &str, out: &mut Vec<u8>) -> bool {
+    let (Some(read), Ok(path)) = (FALLBACK_READ.get(), std::ffi::CString::new(path)) else { return false };
+    let (mut data, mut length) = (std::ptr::null_mut::<u8>(), 0usize);
+    // SAFETY: the caller's contract: on true, `data` holds `length` bytes from malloc, which are freed here.
+    unsafe {
+        if !read(path.as_ptr(), &mut data, &mut length) || data.is_null() {
+            return false;
+        }
+        out.extend_from_slice(std::slice::from_raw_parts(data, length));
+        libc::free(data.cast());
+    }
+    true
+}
+
+/// Set the read-only source behind every shader-cache directory, before the device opens; false where one was set already.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_set_shader_cache_fallback(read: Option<FallbackRead>) -> bool {
+    match read {
+        Some(read) => FALLBACK_READ.set(read).is_ok() && metal2vulkan_runtime::set_shader_cache_fallback(fallback_read),
+        None => false,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -877,6 +927,29 @@ pub extern "C" fn nmb_heap_new_texture(heap: *const NmbHeap, descriptor: *const 
     })
 }
 
+/// `heapTextureSizeAndAlignWithDescriptor:`: the bytes the texture takes of a heap and the alignment of its offset, into `out[0]` and
+/// `out[1]`; false, with the reason, for a descriptor the runtime refuses.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_heap_texture_size_and_align(device: *const NmbDevice, descriptor: *const NmbTextureDescriptor, out: *mut u64) -> bool {
+    guard(false, || {
+        let answer = get(device)?.0.heap_texture_size_and_align(&texture_descriptor(descriptor)?).map_err(e("heap texture size"))?;
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 2) };
+        (out[0], out[1]) = (answer.size, answer.align);
+        Ok(true)
+    })
+}
+
+/// `heapBufferSizeAndAlignWithLength:options:`, as `nmb_device_heap_texture_size_and_align` answers a texture.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_heap_buffer_size_and_align(device: *const NmbDevice, length: u64, options_word: u64, out: *mut u64) -> bool {
+    guard(false, || {
+        let answer = get(device)?.0.heap_buffer_size_and_align(length, options(options_word)?);
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 2) };
+        (out[0], out[1]) = (answer.size, answer.align);
+        Ok(true)
+    })
+}
+
 // ---- textures ----
 
 #[repr(C)]
@@ -1163,6 +1236,25 @@ pub struct NmbConstant {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nmb_function_new_specialized(library: *mut NmbLibrary, name: *const c_char, constants: *const NmbConstant,
                                                       count: u32) -> *mut NmbFunction {
+    // SAFETY: the caller's contract.
+    unsafe { specialized(library, name, constants, count, false) }
+}
+
+/// The same with every declared constant the caller did not give a value set to zero (false for a bool). Metal accepts a function
+/// whose code reads a constant nobody set; the translator needs a value (`NeedsInput(FunctionConstant)`), and zero is what such a
+/// read yields there. The frontend retries a pipeline with this variant only after the specialized one was refused for that reason.
+///
+/// # Safety
+/// As for `nmb_function_new_specialized`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_function_new_specialized_zero_rest(library: *mut NmbLibrary, name: *const c_char,
+                                                                constants: *const NmbConstant, count: u32) -> *mut NmbFunction {
+    // SAFETY: the caller's contract.
+    unsafe { specialized(library, name, constants, count, true) }
+}
+
+unsafe fn specialized(library: *mut NmbLibrary, name: *const c_char, constants: *const NmbConstant, count: u32,
+                      zero_rest: bool) -> *mut NmbFunction {
     guard(std::ptr::null_mut(), || {
         if name.is_null() || (constants.is_null() && count > 0) {
             return Err("null function name or constants".into());
@@ -1184,6 +1276,20 @@ pub unsafe extern "C" fn nmb_function_new_specialized(library: *mut NmbLibrary, 
                 // SAFETY: the caller's contract.
                 let key = unsafe { CStr::from_ptr(c.name) }.to_str().map_err(e("constant name"))?;
                 values.by_name.insert(key.to_string(), value);
+            }
+        }
+        if zero_rest {
+            let generic = get(library)?.0.new_function_with_name(name).map_err(e("function"))?;
+            for (key, constant) in generic.function_constants_dictionary().map_err(e("function constants"))? {
+                if values.by_name.contains_key(&key) || values.by_index.contains_key(&constant.index()) {
+                    continue;
+                }
+                let ty = constant.data_type();
+                let bytes = constant_bytes(ty.as_raw());
+                if bytes == 0 {
+                    return Err(format!("function constant {key} of type {}", ty.as_raw()));
+                }
+                values.by_index.insert(constant.index(), FunctionConstantValue::new(ty, vec![0; bytes]));
             }
         }
         let function = get(library)?.0.new_function_with_name_constant_values(name, &values).map_err(e("specialized function"))?;
@@ -1405,6 +1511,14 @@ pub struct NmbRenderPipelineDescriptor {
     pub attributes: [NmbVertexAttribute; 31],
     pub layouts: [NmbVertexLayout; 31],
     pub tessellation: NmbTessellation,
+    pub vertex_linked: *const *mut NmbFunction,
+    pub vertex_linked_count: u64,
+    pub vertex_private_linked: *const *mut NmbFunction,
+    pub vertex_private_linked_count: u64,
+    pub fragment_linked: *const *mut NmbFunction,
+    pub fragment_linked_count: u64,
+    pub fragment_private_linked: *const *mut NmbFunction,
+    pub fragment_private_linked_count: u64,
 }
 
 /// A post-tessellation vertex function's state; `tessellates` 0 leaves the descriptor's tessellation unset.
@@ -1471,9 +1585,20 @@ pub unsafe extern "C" fn nmb_render_pipeline_new_with_options(device: *mut NmbDe
 
 fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<RenderPipelineDescriptor, String> {
         let d = get(descriptor)?;
-        let mut out = RenderPipelineDescriptor::new(StageSource::Function(get(d.vertex)?.0.function_descriptor()));
+        // Each stage's linked functions ride on its function descriptor, as the compute pipeline's do (compute_descriptor).
+        let stage_linked = |functions, count, private, private_count| -> Result<LinkedFunctions, String> {
+            let mut linked = LinkedFunctions::new();
+            linked.functions = linked_list(functions, count)?;
+            linked.private_functions = linked_list(private, private_count)?;
+            Ok(linked)
+        };
+        let vertex = get(d.vertex)?.0.function_descriptor()
+            .with_linked(stage_linked(d.vertex_linked, d.vertex_linked_count, d.vertex_private_linked, d.vertex_private_linked_count)?);
+        let mut out = RenderPipelineDescriptor::new(StageSource::Function(vertex));
         if !d.fragment.is_null() {
-            out.fragment = Some(StageSource::Function(get(d.fragment)?.0.function_descriptor()));
+            let fragment = get(d.fragment)?.0.function_descriptor().with_linked(stage_linked(
+                d.fragment_linked, d.fragment_linked_count, d.fragment_private_linked, d.fragment_private_linked_count)?);
+            out.fragment = Some(StageSource::Function(fragment));
         }
         for (slot, c) in out.color_attachments.iter_mut().zip(d.colors.iter()) {
             if c.format == 0 {
@@ -2045,7 +2170,7 @@ fn shared<'a>(event: *const NmbEvent) -> Result<&'a SharedEvent, String> {
 /// forwards to it).
 fn listener() -> Result<&'static SharedEventListener, String> {
     static LISTENER: std::sync::OnceLock<Result<SharedEventListener, String>> = std::sync::OnceLock::new();
-    LISTENER.get_or_init(|| SharedEventListener::new().map_err(e("listener"))).as_ref().map_err(|why| why.clone())
+    LISTENER.get_or_init(|| Ok(SharedEventListener::new())).as_ref().map_err(|why: &String| why.clone())
 }
 
 #[unsafe(no_mangle)]

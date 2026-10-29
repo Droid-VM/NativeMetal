@@ -30,6 +30,8 @@ typedef struct NmbFence NmbFence;
 const char *nmb_last_error(void);
 /* The bridge's embedded AIR fixtures: the runtime's own runtime_examples and kernel_function_constant_gate_fold. */
 const void *nmb_fixture_air(size_t *length);
+// The GPU scanout's half-float conversion kernel as AIR bitcode (GpuScanoutPresenter.h).
+const void *nmb_scanout_convert_air(size_t *length);
 const void *nmb_function_constant_air(size_t *length);
 
 /* loader: a library exporting vkGetInstanceProcAddr (Turnip on the tablet). cache: a writable directory for translated shaders. */
@@ -51,6 +53,9 @@ struct NmbShaderCacheStats {
     uint64_t driver_loads, driver_hits, driver_misses, driver_saves, driver_truncated, driver_mismatched, driver_unchanged;
 };
 bool nmb_device_shader_cache_stats(const NmbDevice *, struct NmbShaderCacheStats *);
+/* The read-only source of shader-cache entries behind every cache directory, set before the device opens: read(path relative to the
+ * directory, out, length) puts the entry in a malloc'd buffer the bridge frees and returns true, or returns false. */
+bool nmb_set_shader_cache_fallback(bool (*read)(const char *path, uint8_t **out, size_t *length));
 size_t nmb_last_warning(char *out, size_t size);
 bool nmb_device_max_threads_per_threadgroup(const NmbDevice *, uint64_t out[3]);
 /* Device queries the runtime answers by Metal selector: Apple's private counts and flags where the device has an answer of its own,
@@ -93,6 +98,8 @@ uint64_t nmb_heap_max_available_size(const NmbHeap *, uint64_t alignment);
 uint64_t nmb_heap_set_purgeable_state(const NmbHeap *, uint64_t state);
 NmbBuffer *nmb_heap_new_buffer(const NmbHeap *, uint64_t length, uint64_t options, uint64_t offset);
 NmbTexture *nmb_heap_new_texture(const NmbHeap *, const struct NmbTextureDescriptor *, uint64_t offset);
+bool nmb_device_heap_texture_size_and_align(const NmbDevice *, const struct NmbTextureDescriptor *, uint64_t out[2]); /* size, align */
+bool nmb_device_heap_buffer_size_and_align(const NmbDevice *, uint64_t length, uint64_t options, uint64_t out[2]);
 NmbTexture *nmb_texture_new(NmbDevice *, const struct NmbTextureDescriptor *);
 /* A linear texture over a buffer's bytes; iosurface marks the buffer as standing for a surface without planes (Metal's IOSurface rules). */
 NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool iosurface);
@@ -125,6 +132,8 @@ struct NmbConstant {uint64_t type, index; const char *name; const void *bytes; u
 NmbFunction *nmb_function_new_specialized(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
 // The library's function with every function constant it declares set to zero (shader priming), or null.
 NmbFunction *nmb_function_new_zero_constants(NmbLibrary *, const char *name);
+/* nmb_function_new_specialized, with every declared constant the caller left out set to zero (false for a bool). */
+NmbFunction *nmb_function_new_specialized_zero_rest(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
 void nmb_function_release(NmbFunction *);
 /* Metal's MTLFunctionType (1 vertex, 2 fragment, 3 kernel, ...). */
 uint64_t nmb_function_type(const NmbFunction *);
@@ -153,6 +162,12 @@ struct NmbRenderPipelineDescriptor {
         uint64_t tessellates, max_factor, partition_mode, factor_format, factor_step_function, output_winding, control_point_index_type,
             factor_scale_enabled;
     } tessellation;
+    /* vertexLinkedFunctions / fragmentLinkedFunctions .functions and .privateFunctions: visible functions each stage calls (RenderBox's
+     * custom_blend fragment functions call theirs this way). Zero counts: none. */
+    NmbFunction *const *vertex_linked; uint64_t vertex_linked_count;
+    NmbFunction *const *vertex_private_linked; uint64_t vertex_private_linked_count;
+    NmbFunction *const *fragment_linked; uint64_t fragment_linked_count;
+    NmbFunction *const *fragment_private_linked; uint64_t fragment_private_linked_count;
 };
 NmbRenderPipeline *nmb_render_pipeline_new(NmbDevice *, const struct NmbRenderPipelineDescriptor *);
 /* Descriptor binaryArchives and MTLPipelineOption bits. NULL options means defaults.

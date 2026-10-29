@@ -11,16 +11,13 @@
 #[path = "NativeMetalObjects.rs"]
 pub mod objects;
 
-/// The runtime allocates and frees on every encoder call (binding tables, recorded calls, tracked uses); mimalloc's thread-local free
-/// lists take those small blocks for less than the system allocator, whose frees from the encoding thread also gave pages back to the
-/// kernel (madvise) as they emptied. Every allocation of the bridge and the runtime is the Rust side's own, freed there.
-#[global_allocator]
-static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// The system allocator: mimalloc reserved its arenas with large mmaps, and on iPadOS 27 the kernel stopped the render server and
+// SpringBoard with an exception inside that mmap (unix_mmap_prim_aligned from mi_arena_reserve), so the shell resprung.
 
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_runtime::{
-    BlitOption, ClearColor, CommandBuffer, CommandBufferStatus, Device, DeviceOptions, HostMemory, LoadAction, MetalLevel,
+    BlitOption, ClearColor, CommandBuffer, CommandBufferStatus, Device, DeviceOptions, HostMemory, LoadAction,
     Origin, PipelineOptions, RenderPassDescriptor, ResourceOptions, Size, StoreAction, TextureDescriptor,
 };
 use std::ffi::{c_char, c_void, CStr};
@@ -91,8 +88,6 @@ fn finish(command_buffer: &CommandBuffer) -> Result<(), String> {
 fn open(loader: &CStr, cache: &CStr) -> Result<Device, String> {
     let mut options = DeviceOptions::default();
     options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
-    // No macOS release names this host; answer as the newest measured Metal.
-    options.metal_level = Some(MetalLevel::NEWEST);
     options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
     Device::system_default_with(&options).map_err(|e| format!("device: {e:?}"))
 }

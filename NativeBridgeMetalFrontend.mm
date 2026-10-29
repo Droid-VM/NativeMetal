@@ -755,6 +755,8 @@ static void waitForResource(id resource);
 @property(nonatomic) void *wrapped;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
 @property(nonatomic) NSUInteger heapOffset;
+// A surface import's surface: the object its no-copy import retains (releaseSurface), valid while the buffer lives.
+@property(nonatomic,assign) IOSurfaceRef importedSurface;
 @end
 @interface NBTexture : NBObject
 @property(nonatomic) NmbTexture *handle;
@@ -822,7 +824,9 @@ struct HeldImport {NBBuffer *buffer;IOSurfaceRef surface;};
 static auto &gHeldImports=*new std::map<std::tuple<uint64_t,uint64_t,uint64_t>,HeldImport>;
 static NSUInteger gSurfaceImportsPruned=64;     // the table size at which dead associations are next pruned
 // Drops (into `gone`, released by the caller outside the lock) every held import whose surface only the import still retains, or every
-// one when `all`.
+// one when `all`. A held import's surface is the one its import retains (NBBuffer.importedSurface), never a caller's: the same surface
+// (identity, address, size) reaches a hit through another IOSurfaceRef object, which its owner may release while the import is still
+// held, and its retain count was then read from freed memory (backboardd faulted in this loop on a completion thread).
 static void pruneHeldImports(bool all,std::vector<NBBuffer *> &gone) {
  for(auto it=gHeldImports.begin();it!=gHeldImports.end();) {
   if(all || CFGetRetainCount(it->second.surface)<=1){gone.push_back(it->second.buffer);it=gHeldImports.erase(it);}
@@ -858,11 +862,11 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
- if(buffer){if(key)holdImport(value.identity,value.address,value.bytes,buffer,surface,gone);return buffer;}
+ if(buffer){if(key && buffer.importedSurface)holdImport(value.identity,value.address,value.bytes,buffer,buffer.importedSurface,gone);return buffer;}
  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
- gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
+ gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.importedSurface=surface;
  if(key) {
   // Associations whose import is gone are pruned whenever the table has doubled since the last pruning; a live one is never evicted.
   if(gSurfaceImports.count>=gSurfaceImportsPruned) {

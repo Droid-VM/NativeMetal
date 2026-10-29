@@ -223,6 +223,14 @@ static id deviceForPort(unsigned port) {
         // pass: i553 forced system memory for every pass, the GPU busy 19 % at 680 MHz. A tile store writes whole 16x4 blocks, which the
         // runtime keeps within a texture's rows (bridge patch 0016).
         setenv("TU_DEBUG", "nocb", 0);
+        // Diagnostic: while /private/var/ngpu/debug/mesa-log exists when the process opens its device, Mesa's log -- Turnip's reason
+        // for a lost device among it -- goes to mesa.log in the process's temporary directory instead of the stderr no reader of a
+        // daemon's sees, and a lost device aborts the process where Turnip declares it, so the crash report names the place.
+        if (access("/private/var/ngpu/debug/mesa-log", F_OK) == 0) {
+            char log[512];
+            if (confstr(_CS_DARWIN_USER_TEMP_DIR, log, sizeof log - 16)) {strlcat(log, "mesa.log", sizeof log); setenv("MESA_LOG_FILE", log, 1);}
+            setenv("MESA_VK_ABORT_ON_DEVICE_LOSS", "1", 1);
+        }
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {

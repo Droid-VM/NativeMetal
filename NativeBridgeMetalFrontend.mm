@@ -1605,6 +1605,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
  uint32_t createCpu,createTid,commitCpu,commitTid;
  BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
  std::vector<WatchedSource> watched;
+ std::atomic<uint64_t> holdTicket;   // the display hold its commit took (displayhold), ended once the runtime has submitted it
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -1824,6 +1825,52 @@ static void encodeDrain() {
  t.idle.wait(lock,[&]{return t.done>=target;});
 }
 #define ENCODE(...) encodeLater([=]{__VA_ARGS__;})
+// The display hold of the DroidVM board's virtio GPU (its DroidVMVirtioGpu3D.cpp hold(), an op past DroidVMVirtgpuABI.h's through
+// NativeAdreno's tunnel). CoreAnimation's commitAndWaitUntilSubmitted waits until the work is submitted, which with the encoding
+// thread means until the thread has translated the frame's last calls: a page swipe at 2048x2732 held the render server's display
+// thread there a quarter of its time (CA's own work and the thread's then add up instead of overlapping), 90 frames a second of
+// 120. With a hold the commit returns at once: it takes a hold, which the kernel's display waits for before the swap made after it
+// is shown (then for the work submitted by then), and the runtime's scheduling of the work ends it. Only the render server, whose
+// swaps the board's display shows; /private/var/ngpu/debug/no-display-hold turns it off (read when the process starts).
+namespace displayhold {
+using CallFn=int (*)(unsigned,uint32_t,const void *,size_t,void *,size_t *);
+static CallFn gCall;
+static unsigned gConnection,gSelector=256;
+// 0: take a hold, answering its ticket (0 when refused); else end that ticket.
+static uint64_t call(uint64_t ticket) {
+ uint32_t in[4]={0x4e544e4cu,0x7200+10};   // the tunnel's magic and the method (DROIDVM_VIRTGPU_METHOD + the hold op)
+ memcpy(in+2,&ticket,sizeof ticket);
+ uint64_t out=0;size_t size=sizeof out;
+ return gCall(gConnection,gSelector,in,sizeof in,&out,&size)==0?out:0;
+}
+static bool available() {
+ static const bool ok=[]{
+  if(!gEncodeThread || !isRenderServer() || access("/private/var/ngpu/debug/no-display-hold",F_OK)==0)return false;
+  void *iokit=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW|RTLD_LOCAL);if(!iokit)return false;
+  auto matching=(CFMutableDictionaryRef (*)(const char *))dlsym(iokit,"IOServiceMatching");
+  auto service=(unsigned (*)(unsigned,CFDictionaryRef))dlsym(iokit,"IOServiceGetMatchingService");
+  auto open=(int (*)(unsigned,unsigned,uint32_t,unsigned *))dlsym(iokit,"IOServiceOpen");
+  auto release=(int (*)(unsigned))dlsym(iokit,"IOObjectRelease");
+  gCall=(CallFn)dlsym(iokit,"IOConnectCallStructMethod");
+  if(!matching || !service || !open || !release || !gCall)return false;
+  // A connection of its own, as Turnip's (open type 0x4149, virtgpu only); the tunnel's selector is whichever one is admitted.
+  const unsigned accelerator=service(0,matching("IOAcceleratorES"));if(!accelerator)return false;
+  const int status=open(accelerator,mach_task_self(),0x4149,&gConnection);release(accelerator);
+  if(status)return false;
+  const uint32_t probe[2]={0x4e544e4cu,0xffffffffu};
+  for(gSelector=0;gSelector<256;gSelector++)if(gCall(gConnection,gSelector,probe,sizeof probe,nullptr,nullptr)==0)break;
+  if(gSelector==256)return false;
+  const uint64_t ticket=call(0);   // a kernel without holds refuses the op
+  if(!ticket)return false;
+  call(ticket);
+  NSLog(@"native-metal: commits return before submission (display holds)");
+  return true;
+ }();
+ return ok;
+}
+static uint64_t take() {return available()?call(0):0;}
+static void end(std::atomic<uint64_t> &ticket) {if(const uint64_t t=ticket.exchange(0))call(t);}
+}
 // Held while a resource wait reads an in-flight command buffer's runtime handle and while a locally refused command buffer frees it.
 static std::mutex gRuntimeHandleLock;
 static void waitForResource(id resource) {
@@ -2582,7 +2629,11 @@ static char kUserDictionaryKey;
 // The kernel driver's own submission times are not recorded: 0 is Metal's answer where they are unavailable.
 - (CFTimeInterval)kernelStartTime {return 0;}
 - (CFTimeInterval)kernelEndTime {return 0;}
-- (BOOL)commitAndWaitUntilSubmitted {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;}
+- (BOOL)commitAndWaitUntilSubmitted {
+ if(!self.committed && !onEncodeQueue())
+  if(const uint64_t ticket=displayhold::take()){holdTicket=ticket;[(id<MTLCommandBuffer>)self commit];return YES;}
+ [(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;
+}
 - (CFTimeInterval)GPUStartTime {return self.submitted && !self.failedLocally?nmb_command_buffer_gpu_time(_handle,false):0;}
 - (CFTimeInterval)GPUEndTime {return self.submitted && !self.failedLocally?nmb_command_buffer_gpu_time(_handle,true):0;}
 // An encoder whose runtime half `make` makes, on the encoding thread when that is on. A refused encoder is still an object: its calls
@@ -2703,6 +2754,7 @@ static char kUserDictionaryKey;
 - (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:false];}
 // The runtime has submitted the work. Deliver scheduling without waiting for GPU completion.
 - (void)didSchedule {
+ displayhold::end(holdTicket);
  {
   const uint64_t took=nowUs()-self.committedUs;
   std::lock_guard<std::mutex> lock(gCommitLock);
@@ -2723,6 +2775,7 @@ static char kUserDictionaryKey;
 }
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
+ displayhold::end(holdTicket);   // a command buffer that never scheduled (a refusal) holds no swap back
  flushSurfaces(_surfaces);
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.

@@ -4414,6 +4414,17 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
     (unsigned long long)gTrimmedBlocks.load(),(unsigned long long)(bc[5]>>20),(unsigned long long)(bc[6]>>20),
     (unsigned long long)bc[2],(unsigned long long)bc[3]);
   }
+  // What held the runtime's batches back from the GPU (nmb_device_scheduler_counts): heads held for a host step and of them at their
+  // gate (the GPU drained first), for an event value, behind an earlier commit; batches held and for how long; grouped submissions,
+  // their batches, groups kept pending and sent with nothing ready; then batches submitted with 0, 1, 2-3, 4+ earlier ones pending.
+  uint64_t sc[16]={};
+  if(nmb_device_scheduler_counts(gDevice,sc)) {
+   row("Q host %llu gate %llu ev %llu early %llu | held %llu %llums | grp %llu/%llu kept %llu idle %llu",
+    (unsigned long long)sc[0],(unsigned long long)sc[1],(unsigned long long)sc[2],(unsigned long long)sc[3],(unsigned long long)sc[4],
+    (unsigned long long)(sc[5]/1000000),(unsigned long long)sc[6],(unsigned long long)sc[7],(unsigned long long)sc[8],(unsigned long long)sc[9]);
+   row("Q pending 0:%llu 1:%llu 2-3:%llu 4+:%llu | cb %llu gw %llu",(unsigned long long)sc[10],(unsigned long long)sc[11],
+    (unsigned long long)sc[12],(unsigned long long)sc[13],(unsigned long long)sc[14],(unsigned long long)sc[15]);
+  }
   // How Turnip rendered the passes (tu_render_mode_stats): GMEM passes and their Mpx, SYSMEM passes the autotuner chose and theirs,
   // SYSMEM passes for another reason and theirs, then GMEM passes with an attachment loaded or stored over its texels alone.
   {

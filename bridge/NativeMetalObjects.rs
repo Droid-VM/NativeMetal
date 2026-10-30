@@ -367,6 +367,29 @@ pub extern "C" fn nmb_device_memory_counts(device: *const NmbDevice, out: *mut u
     })
 }
 
+/// What held the scheduler's batches back from the GPU, into the caller's sixteen words: heads found held for their host step, of them
+/// left waiting at their gate (every `VkQueue` to complete what was submitted before), heads held for an event value and behind an
+/// earlier commit; batches held past a look and the nanoseconds they were held; grouped submissions, the batches in them, groups kept
+/// pending (two or more earlier submissions not seen complete) and groups that went when no batch was ready; batches submitted with
+/// none, one, two or three, and four or more earlier batches of their `VkQueue` pending; and the command buffers submitted.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_scheduler_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's sixteen words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 16) };
+        let w = get(device)?.0.work_counts();
+        out.copy_from_slice(&[w.heads_held_for_host_steps, w.heads_waiting_at_their_gate, w.heads_held_for_event_values,
+                              w.heads_held_for_earlier_commits, w.batches_held_past_a_look, w.batch_hold_nanos, w.grouped_submissions,
+                              w.batches_grouped, w.groups_kept_pending, w.group_ends_held, w.batches_with_none_pending,
+                              w.batches_with_one_pending, w.batches_with_two_or_three_pending, w.batches_with_four_or_more_pending,
+                              w.command_buffers_submitted, w.gate_waits]);
+        Ok(true)
+    })
+}
+
 /// Frees the runtime's kept empty pooled blocks that have stayed empty for `idle_ms` or longer (0: all of them), answering how many
 /// went (the board's patches/metal2vulkan/0013-trim-kept-memory.patch): the frontend trims as its process idles and on memory pressure,
 /// since on a guest whose GPU imports its pages every block is wired memory the system cannot reclaim.

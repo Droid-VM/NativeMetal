@@ -51,6 +51,7 @@ bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
 // Bytes of pooled blocks live and placed in them, empty kept, dedicated, host imports; bytes allocated so far; pooled and dedicated
 // blocks live; GPU pool blocks made and released.
 bool nmb_device_memory_counts(const NmbDevice *, uint64_t out[10]);
+uint32_t nmb_device_trim_memory(const NmbDevice *, uint32_t idle_ms);
 // Call stacks that allocated device memory of 4 MiB or more, most bytes first: records of twelve words (bytes, allocations, ten return
 // addresses); returns how many were written, at most max.
 size_t nmb_allocation_sites(uint64_t *out, size_t max);

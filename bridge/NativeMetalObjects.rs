@@ -367,6 +367,14 @@ pub extern "C" fn nmb_device_memory_counts(device: *const NmbDevice, out: *mut u
     })
 }
 
+/// Frees the runtime's kept empty pooled blocks that have stayed empty for `idle_ms` or longer (0: all of them), answering how many
+/// went (the board's patches/metal2vulkan/0013-trim-kept-memory.patch): the frontend trims as its process idles and on memory pressure,
+/// since on a guest whose GPU imports its pages every block is wired memory the system cannot reclaim.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_trim_memory(device: *const NmbDevice, idle_ms: u32) -> u32 {
+    guard(0, || Ok(get(device)?.0.trim_kept_memory(std::time::Duration::from_millis(u64::from(idle_ms))) as u32))
+}
+
 /// The call stacks that allocated device memory of 4 MiB or more (bridge patch 0020), most bytes first, into the caller's `max` records
 /// of twelve words: bytes, allocations, then ten return addresses (0 past the stack's end). Returns the records written.
 #[unsafe(no_mangle)]

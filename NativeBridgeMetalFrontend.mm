@@ -149,6 +149,7 @@ static void (*gMissing)(const char *, const char *);
 // What this device has been asked and refused, for the plugin's status line (native_bridge_metal_status): commits, render/compute pipelines made,
 // refusals, and the last two refusals' texts. Counters only; nothing here changes a result.
 static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gCompleted,gWaitTimeouts;
+static std::atomic<uint64_t> gTrimmedBlocks;   // kept empty memory blocks freed (watchIdleMemory, watchImportPressure)
 // What the render server actually asks of the GPU (int-141: 59 commits in 200 s, and a desktop that behaves like CPU compositing): render passes,
 // draws, the pixels of their first colour attachment, compute dispatches, blits and the largest pass (pixels).
 static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses;
@@ -852,8 +853,27 @@ static void watchImportPressure() {
   dispatch_source_t source=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,
    DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
   if(!source)return;
-  dispatch_source_set_event_handler(source,^{trimHeldImports(true);});
+  dispatch_source_set_event_handler(source,^{trimHeldImports(true);if(gDevice)gTrimmedBlocks+=nmb_device_trim_memory(gDevice,0);});
   dispatch_activate(source);
+ });
+}
+// The runtime's kept empty memory blocks go once the process has committed nothing for two seconds (those empty for one second or
+// more), and all of them on memory pressure (watchImportPressure): it keeps the last empty block of each memory pool for its next
+// placements however long the process stays idle, and on this guest every block is wired memory -- the render server held 136 MiB of
+// them at the home screen, a wallpaper or widget renderer its own.
+static void watchIdleMemory() {
+ static dispatch_once_t once;
+ dispatch_once(&once,^{
+  dispatch_source_t timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
+  if(!timer)return;
+  dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),2*NSEC_PER_SEC,250*NSEC_PER_MSEC);
+  __block uint64_t seen=0;
+  dispatch_source_set_event_handler(timer,^{
+   const uint64_t commits=gCommits.load();
+   if(commits==seen && gDevice)gTrimmedBlocks+=nmb_device_trim_memory(gDevice,1000);
+   seen=commits;
+  });
+  dispatch_activate(timer);
  });
 }
 // The entry records the surface object the import itself retains, never the caller's: a hit may come with another object for the same
@@ -4152,6 +4172,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(loader)gLoaderPath=loader;
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
+ watchImportPressure();watchIdleMemory();
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
@@ -4376,10 +4397,11 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
    static void (*cacheStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_darwin_bo_cache_stats"):nullptr;
    if(cacheStats)cacheStats(bc);
-   row("MEM pool %llu(%llu) empty %llu ded %llu imp %llu alloc %llu | blk %llu/%llu gp %llu-%llu | tuc %llu/%llu n%llu/%llu",
+   // (tr: kept empty blocks trimmed, in place of the GPU pool blocks made and released, which stay 0 on this board: the row has 90 characters)
+   row("MEM pool %llu(%llu) empty %llu ded %llu imp %llu alloc %llu | blk %llu/%llu tr %llu | tuc %llu/%llu n%llu/%llu",
     (unsigned long long)(mc[0]>>20),(unsigned long long)(mc[1]>>20),(unsigned long long)(mc[2]>>20),(unsigned long long)(mc[3]>>20),
     (unsigned long long)(mc[4]>>20),(unsigned long long)(mc[5]>>20),(unsigned long long)mc[6],(unsigned long long)mc[7],
-    (unsigned long long)mc[8],(unsigned long long)mc[9],(unsigned long long)(bc[5]>>20),(unsigned long long)(bc[6]>>20),
+    (unsigned long long)gTrimmedBlocks.load(),(unsigned long long)(bc[5]>>20),(unsigned long long)(bc[6]>>20),
     (unsigned long long)bc[2],(unsigned long long)bc[3]);
   }
   // How Turnip rendered the passes (tu_render_mode_stats): GMEM passes and their Mpx, SYSMEM passes the autotuner chose and theirs,

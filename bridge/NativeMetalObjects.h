@@ -45,6 +45,15 @@ bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
 const char *nmb_runtime_build(void);
 // Linear images made/refused/refused again, shadowed textures, shadow copies, texels copied back, linear passes in place/through copies.
 bool nmb_device_texture_counts(const NmbDevice *, uint64_t out[8]);
+// Passes begun as instances, split inline; instance splits for a barrier, tile memory, a memoryless write, a pending pipeline; stand-ins
+// made and their bytes; stand-in copies made and those made at draws.
+bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
+// Bytes of pooled blocks live and placed in them, empty kept, dedicated, host imports; bytes allocated so far; pooled and dedicated
+// blocks live; GPU pool blocks made and released.
+bool nmb_device_memory_counts(const NmbDevice *, uint64_t out[10]);
+// Call stacks that allocated device memory of 4 MiB or more, most bytes first: records of twelve words (bytes, allocations, ten return
+// addresses); returns how many were written, at most max.
+size_t nmb_allocation_sites(uint64_t *out, size_t max);
 // No-copy ranges checked, and those whose pages had changed since a buffer was last made over them (reported to the runtime as remapped).
 bool nmb_no_copy_remaps(uint64_t out[2]);
 /* Artifact lookups and driver pipeline records are separate cache layers. */
@@ -53,9 +62,6 @@ struct NmbShaderCacheStats {
     uint64_t driver_loads, driver_hits, driver_misses, driver_saves, driver_truncated, driver_mismatched, driver_unchanged;
 };
 bool nmb_device_shader_cache_stats(const NmbDevice *, struct NmbShaderCacheStats *);
-/* The read-only source of shader-cache entries behind every cache directory, set before the device opens: read(path relative to the
- * directory, out, length) puts the entry in a malloc'd buffer the bridge frees and returns true, or returns false. */
-bool nmb_set_shader_cache_fallback(bool (*read)(const char *path, uint8_t **out, size_t *length));
 size_t nmb_last_warning(char *out, size_t size);
 bool nmb_device_max_threads_per_threadgroup(const NmbDevice *, uint64_t out[3]);
 /* Device queries the runtime answers by Metal selector: Apple's private counts and flags where the device has an answer of its own,

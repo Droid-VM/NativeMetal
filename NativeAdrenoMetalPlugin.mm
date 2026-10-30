@@ -22,7 +22,6 @@
 #include "NativeMetalBridgePhase.h"
 #include "CacheExport.h"
 #include "PrimeShaders.h"
-#include "CacheImport.h"
 #include "ExceptionDiag.h"
 
 @interface _MTLDevice : NSObject
@@ -172,6 +171,14 @@ static void clientFailure(unsigned port, const char *step, const char *detail) {
         char text[64];
         snprintf(text, sizeof text, "%.14s %s", step, shown);
         streamText(*gpu, text);
+        // A refusal's text is what says why a client ends (iconservicesagent's pipeline refusal showed 18 characters of it): the rest of it
+        // follows in rows of its own, up to six, each 46 characters.
+        if (!strcmp(step, "problem") && length > 46)
+            for (unsigned part = 1, at = 46; part <= 6 && at < length; ++part, at += 46) {
+                char row[64];
+                snprintf(row, sizeof row, "problem%u %.46s", part, detail + at);
+                streamText(*gpu, row);
+            }
     }
 }
 static id clientDevice(unsigned port) {
@@ -296,14 +303,58 @@ static id deviceForPort(unsigned port) {
 #if defined(__arm64e__)
         // iPadOS 27 picks a 64-bit half-float framebuffer ('RGhA') whenever the display's EDR headroom is above 1 (this panel reports XDR
         // headroom), which the display path can only show converted, slowly and greyed. As on iPadOS 17, where the render server drew plain
-        // 8-bit BGRA, the headroom is held at 1: the render server's headroom override (CA::WindowServer::Display::edr_headroom reads it
-        // first when nonzero; 24A446 QuartzCore __DATA_DIRTY 0x1e7021014, CARenderServerStart at 0x1846dce88 for the cache slide) and its
-        // environment spelling for an option table read after this.
+        // 8-bit BGRA, the headroom is held at 1. IOMFBDisplay::framebuffer_pixel_format (24A446 0x184461838, asked on every update) takes
+        // RGhA when the headroom (Display::edr_headroom, CA_DISPLAY_EDR_HEADROOM first when nonzero) is above CA_FP16_MIN_HEADROOM and
+        // the panel's own above 8, or when CA_FORCE_FP16_FRAMEBUFFER, CA_ALLOW_EDR_MIRRORING or the display's own flag says so. Both
+        // options are QuartzCore's float options: init_debug reads them from the environment into debug_values (index 21 at
+        // __DATA_DIRTY 0x1e7021014, index 81 at 0x1e7021104), so they are set in the environment for a read after this and written for
+        // one before it. i84edf75a1 wrote only the stored values (marks 6E01, 6E02) and the framebuffer stayed RGhA: an option read after
+        // the plugin loaded put the threshold back to 0. CADefaultsGetFloat takes the environment first (getenv, atof), then the defaults:
+        // a threshold of 1e30 is above any headroom.
+        // id02fe1633 read back 0x6E19 in one process: CA_ALLOW_EDR_MIRRORING set and the threshold not raised (a process whose options
+        // were read after the write). The mirroring option is held off the same two ways (bool option 156 at _ca_debug_options
+        // 0x1e702116c + 156; init_debug stores value != 0).
         setenv("CA_DISPLAY_EDR_HEADROOM", "1", 1);
+        setenv("CA_FP16_MIN_HEADROOM", "1e30", 1);
+        setenv("CA_ALLOW_EDR_MIRRORING", "0", 1);
         if (void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart")) {
             const uintptr_t slide = (uintptr_t)ptrauth_strip(start, ptrauth_key_function_pointer) - 0x1846dce88;
-            const float one = 1.0f;
+            const float one = 1.0f, never = 1e30f;
             gpu->mark(writeTask(0x1e7021014 + slide, &one, sizeof one) ? 0x6E01 : 0x6EF1);
+            gpu->mark(writeTask(0x1e7021104 + slide, &never, sizeof never) ? 0x6E02 : 0x6EF2);
+            const uint8_t off = 0;
+            gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
+            // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
+            // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
+            // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156), 0x10 the device-is-virtualized byte (0x1e701bdd9).
+            // i35abaf83 read 0x6E23 and the framebuffer stayed RGhA (48388K swap surfaces, 8 bytes a pixel). The function has two more
+            // ways to RGhA: the display's own flag (+0x6840 of the display) and, when no compression format was picked, the virtualized
+            // byte, which sub_184541f10 stores once from a call with the constant CFString at 0x1e9021680; the string's text is noted
+            // ("ca virtualized key ...") so the answer behind it can be found.
+            static uintptr_t gSlide;
+            gSlide = slide;
+            pthread_t reader;
+            if (!strcmp(getprogname(), "backboardd") && pthread_create(&reader, nullptr, [](void *arg) -> void * {
+                sleep(30);
+                const float headroom = *reinterpret_cast<volatile const float *>(0x1e7021014 + gSlide);
+                const float threshold = *reinterpret_cast<volatile const float *>(0x1e7021104 + gSlide);
+                const uint8_t force = *reinterpret_cast<volatile const uint8_t *>(0x1e702116c + 128 + gSlide);
+                const uint8_t mirroring = *reinterpret_cast<volatile const uint8_t *>(0x1e702116c + 156 + gSlide);
+                const uint8_t virtualized = *reinterpret_cast<volatile const uint8_t *>(0x1e701bdd9 + gSlide);
+                static_cast<Gpu *>(arg)->mark(0x6E20 | (headroom == 1.0f ? 1 : 0) | (threshold > 1.0f ? 2 : 0) | (force ? 4 : 0) | (mirroring ? 8 : 0) |
+                                              (virtualized ? 0x10 : 0));
+                // A constant CFString: isa, flags, bytes, length. Only an 8-bit constant (flags 0x7c8) with a short length is read.
+                const uint64_t *cf = reinterpret_cast<const uint64_t *>(0x1e9021680 + gSlide);
+                char note[96];
+                if ((uint32_t)cf[1] == 0x7c8 && cf[3] > 0 && cf[3] < 64) {
+                    const char *text = reinterpret_cast<const char *>(ptrauth_strip(reinterpret_cast<void *>(cf[2]), ptrauth_key_process_independent_data));
+                    snprintf(note, sizeof note, "ca virtualized key %.*s = %u", (int)cf[3], text, virtualized);
+                } else
+                    snprintf(note, sizeof note, "ca virtualized key ? flags %llx = %u", (unsigned long long)cf[1], virtualized);
+                native_bridge_metal_note(note);
+                return nullptr;
+            }, gpu) == 0)
+                pthread_detach(reader);
         }
 #endif
         // On an iPad the render server's queue runs at a high GPU priority (CoreAnimation asks for it with setGPUPriority: when it makes
@@ -335,29 +386,10 @@ static id deviceForPort(unsigned port) {
             strlcat(candidates[i], "m2v", sizeof candidates[i]);
             mkdir(candidates[i], 0700);
             if (access(candidates[i], W_OK) != 0) continue;
-            // The pipeline caches compiled ahead on the host, read on demand from the userdata import region behind this directory
-            // (CacheImport.h), and the files an earlier image's copying import left half written there (int 590aaee2), which hold memory
-            // of the RAM Data disk.
+            // Files an earlier image's copying import left half written here (int 590aaee2), which hold memory of the Data disk.
             {
                 static bool once;
-                if (!once) {
-                    once = true;
-                    removeHalfImported(candidates[i]);
-                    if (cacheimport::open(*gpu)) {
-                        nmb_set_shader_cache_fallback(cacheimport::read);
-                        uint8_t *done = nullptr;
-                        size_t length = 0;
-                        if (cacheimport::read("prime-done", &done, &length)) {
-                            const std::string text(reinterpret_cast<const char *>(done), length);
-                            free(done);
-                            for (size_t at = 0, end; at < text.size(); at = end + 1) {
-                                end = text.find('\n', at);
-                                if (end == std::string::npos) end = text.size();
-                                if (end > at) prime::extraDone().insert(text.substr(at, end - at));
-                            }
-                        }
-                    }
-                }
+                if (!once) {once = true; removeHalfImported(candidates[i]);}
             }
             // The image's pipeline pack (an earlier boot's export), into this directory before the runtime reads it. Marker 0x6Cnn: files written
             // (saturated at 0xfe), 0x6Cff the pack was refused.
@@ -465,11 +497,11 @@ static id deviceForPort(unsigned port) {
         pthread_attr_setstacksize(&attributes, 8u << 20);
         pthread_t primer;
         pthread_create(&primer, &attributes, [](void *) -> void * {
-            char list[1024];
-            prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
-                       requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string());
-            return nullptr;
-        }, nullptr);
+                char list[1024];
+                prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
+                           requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string());
+                return nullptr;
+            }, nullptr);
         pthread_attr_destroy(&attributes);
         gpu->mark(0x6803);
         return device;

@@ -20,6 +20,7 @@
 #include <atomic>
 #include <mutex>
 #include <pthread.h>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -119,8 +120,6 @@ static void abortProbe(int signal, siginfo_t *si, void *context) {
 }
 // NATIVE_METAL_TIMING=1: the telemetry table (where the CPU side's time went: pipelines, libraries, compiles and the shader cache)
 // written to standard error every 20 s (an app the system ends at the end of a test never reaches atexit).
-// The plugin's on-demand region reads (CacheImport.h). Weak here: the plugin's own definition wins, and a host build reads zeros.
-extern "C" {__attribute__((weak)) volatile uint64_t native_cache_import_stats[4]; __attribute__((weak)) char native_cache_import_first_miss[160];}
 extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size);
 static void *reportTiming(void *) {
  static char table[6144];
@@ -159,6 +158,10 @@ static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
 struct Timed {std::atomic<uint64_t> count{0},total{0},slowest{0};
  void add(uint64_t began){const uint64_t took=nowUs()-began;count++;total+=took;uint64_t seen=slowest.load();while(took>seen && !slowest.compare_exchange_weak(seen,took)){}}};
 static Timed gTimePipeline,gTimeLibrary,gTimeFunction,gTimeEncodeToCommit;
+// Where a frame's time goes, as histograms over power-of-two millisecond buckets (<1, <2, <4 ... <256, more): commit to completion of the
+// command buffers that hold a full-screen pass (a frame's), of every other one, and a frame's encoding (creation to commit).
+static std::atomic<uint64_t> gHistFrameGpu[10],gHistOtherGpu[10],gHistFrameEncode[10];
+static void histAdd(std::atomic<uint64_t> *bins,uint64_t us) {unsigned b=0;const uint64_t ms=us/1000;while(b<9 && ms>=(1ull<<b))++b;bins[b]++;}
 static Timed gTimeCompile;                     // the system compiler's requests (codeGenRequest), the shader cache's misses
 static std::atomic<uint64_t> gCompileCached;   // requests the shader cache answered
 static Timed gTimeWaitScheduled,gTimeWaitCompleted;
@@ -399,6 +402,8 @@ static void noteProblem(NSString *what) {
  memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
  strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
 }
+// A note from the plugin (NativeAdrenoMetalPlugin.mm), for the telemetry's problem lines.
+extern "C" void native_bridge_metal_note(const char *what) {noteProblem([NSString stringWithUTF8String:what]?:@"?");}
 // NMB_LOG_STDERR: also on stderr (a daemon's NSLog reaches only the unified log, which a bring-up board does not read).
 static bool logToStderr() {static bool on=getenv("NMB_LOG_STDERR")!=nullptr;return on;}
 #define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);\
@@ -463,6 +468,7 @@ __attribute__((weak)) volatile uint32_t native_prime_libraries_done;
 __attribute__((weak)) volatile uint32_t native_prime_libraries_total;
 __attribute__((weak)) volatile uint32_t native_prime_made;
 __attribute__((weak)) volatile uint32_t native_prime_rate;
+__attribute__((weak)) volatile uint32_t native_prime_functions_resumed;
 }
 static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
  gSurfaceRefusals++;
@@ -756,8 +762,8 @@ static void waitForResource(id resource);
 @property(nonatomic) void *wrapped;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
 @property(nonatomic) NSUInteger heapOffset;
-// A surface import's surface: the object its no-copy import retains (releaseSurface), valid while the buffer lives.
-@property(nonatomic,assign) IOSurfaceRef importedSurface;
+// A surface import's own surface object, which the runtime buffer retains until it is freed (surfaceBuffer); nullptr otherwise.
+@property(nonatomic) IOSurfaceRef importedSurface;
 @end
 @interface NBTexture : NBObject
 @property(nonatomic) NmbTexture *handle;
@@ -850,9 +856,12 @@ static void watchImportPressure() {
   dispatch_activate(source);
  });
 }
-static void holdImport(uint64_t identity,uint64_t address,uint64_t bytes,NBBuffer *buffer,IOSurfaceRef surface,std::vector<NBBuffer *> &gone) {
+// The entry records the surface object the import itself retains, never the caller's: a hit may come with another object for the same
+// surface, which nothing here retains, and a later prune read its retain count after the caller freed it (backboardd died on the isa
+// authentication inside CFGetRetainCount, called from pruneHeldImports at a command buffer's completion).
+static void holdImport(uint64_t identity,uint64_t address,uint64_t bytes,NBBuffer *buffer,std::vector<NBBuffer *> &gone) {
  pruneHeldImports(false,gone);
- gHeldImports[{identity,address,bytes}]={buffer,surface};
+ gHeldImports[{identity,address,bytes}]={buffer,buffer.importedSurface};
 }
 static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  struct Key {uint64_t identity,address,bytes;};
@@ -863,7 +872,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
- if(buffer){if(key && buffer.importedSurface)holdImport(value.identity,value.address,value.bytes,buffer,buffer.importedSurface,gone);return buffer;}
+ if(buffer){if(key)holdImport(value.identity,value.address,value.bytes,buffer,gone);return buffer;}
  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
@@ -876,7 +885,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
    gSurfaceImportsPruned=MAX(gSurfaceImports.count*2,(NSUInteger)64);
   }
   [gSurfaceImports setObject:buffer forKey:key];
-  holdImport(value.identity,value.address,value.bytes,buffer,surface,gone);
+  holdImport(value.identity,value.address,value.bytes,buffer,gone);
  }
  return buffer;
 }
@@ -1127,8 +1136,30 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
 }
+// Textures over host pages whose rows or offset are not whole 64-byte steps, which no linear image of this GPU lays out (fd6_layout: a
+// linear pitch of 64 bytes): the runtime keeps them as shadows and copies their bytes in. Count, bytes, and the largest one's size and
+// caller, for the telemetry's TB row.
+static std::mutex gUnalignedLock;
+static uint64_t gUnalignedCount,gUnalignedBytes,gUnalignedLargest,gUnalignedCaller;
+static uint32_t gUnalignedSize[3];
+static char gUnalignedImage[24];
+static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,const void *caller) {
+ if(!(row%64) && !(offset%64))return;
+ const uint64_t bytes=(uint64_t)row*d.height*(d.depth?d.depth:1);
+ std::lock_guard<std::mutex> lock(gUnalignedLock);
+ gUnalignedCount++;gUnalignedBytes+=bytes;
+ if(bytes<=gUnalignedLargest)return;
+ gUnalignedLargest=bytes;gUnalignedSize[0]=(uint32_t)d.width;gUnalignedSize[1]=(uint32_t)d.height;gUnalignedSize[2]=(uint32_t)row;
+ Dl_info info={};
+ if(dladdr(caller,&info) && info.dli_fbase) {
+  gUnalignedCaller=(uint64_t)caller-(uint64_t)info.dli_fbase;
+  const char *name=info.dli_fname?strrchr(info.dli_fname,'/'):nullptr;
+  strlcpy(gUnalignedImage,name?name+1:(info.dli_fname?info.dli_fname:"?"),sizeof gUnalignedImage);
+ } else {gUnalignedCaller=(uint64_t)caller;gUnalignedImage[0]=0;}
+}
 @implementation NBBuffer (Textures)
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row {
+ if(self.wrapped)noteUnalignedTexture(d,offset,row,__builtin_return_address(0));
  NBTexture *texture=textureOnBuffer(self,d,offset,row,false);
  if(gLogTextures && self.wrapped)logTexture("no-copy",d,nullptr,0,self.wrapped,offset,row,texture!=nil);
  return (id<MTLTexture>)texture;
@@ -1221,6 +1252,7 @@ static std::string quartzCoreCallers();
 // without them create_metal_dag ended in a null program and iconservicesagent crashed in create_program_and_arguments. Such a function has
 // no runtime handle: it is stitched from its bitcode (functionBitcode) and refused as a pipeline's own function.
 static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(const std::string &,int)> &visit);
 @implementation NBLibrary
 - (void)dealloc {nmb_library_release(_handle);}
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
@@ -1292,6 +1324,19 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
  }
  return names;
 }
+// _MTLLibrary's externFunctionNames: the entries of external linkage (TYPE 5), an empty array for a library without any. iPadOS 27's Core
+// Image collects the precompiled kernels' names so (DAGPrecompiledKernels: [CIKernelLibrary externFunctionNames] of ci_stdlib and
+// ci_filters) and links a kernel into its DAG only when its name is there or in a stitchable library; without the answer (nil, an unknown
+// selector) create_metal_dag gave a null program and iconservicesagent crashed in create_program_and_arguments. Apple's Metal on macOS
+// 26.5.1 answers 228 names for its ci_stdlib and 612 for ci_filters, none for a stitchable library.
+- (NSArray<NSString *> *)externFunctionNames {
+ NSMutableArray<NSString *> *names=[NSMutableArray array];
+ forEachLibraryEntry(self,[&](const std::string &entry,int type) {
+  if(type==5 && !entry.empty())if(NSString *name=@(entry.c_str()))[names addObject:name];
+  return true;
+ });
+ return names;
+}
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name {
  const uint64_t functionBegan=nowUs();
  if(NBFunction *kernel=ciKernelFunction(self,name)){gTimeFunction.add(functionBegan);return (id<MTLFunction>)kernel;}
@@ -1345,34 +1390,44 @@ static NSData *functionBitcode(NBFunction *function) {
  }
  return nil;
 }
-static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
- const uint8_t *file=library.bytes;const size_t length=library.length;const char *wanted=name.UTF8String;
- if(!file || !wanted || length<88 || memcmp(file,"MTLB",4) || file[10]!=1)return nil;
+// Each entry of a metallib's function list, in file order, as its name and TYPE (-1: none); false for a list that is not well formed.
+static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(const std::string &,int)> &visit) {
+ const uint8_t *file=library.bytes;const size_t length=library.length;
+ if(!file || length<88 || memcmp(file,"MTLB",4))return false;
  uint64_t listAt;memcpy(&listAt,file+24,8);
- if(listAt>length-4)return nil;
+ if(listAt>length-4)return false;
  uint32_t count;memcpy(&count,file+listAt,4);
  size_t at=listAt+4;
  for(uint32_t i=0;i<count;i++) {
-  uint32_t size;if(at>length-4)return nil;memcpy(&size,file+at,4);
-  if(size<8 || size>length-at)return nil;
+  uint32_t size;if(at>length-4)return false;memcpy(&size,file+at,4);
+  if(size<8 || size>length-at)return false;
   const size_t end=at+size;
   std::string entry;int type=-1;
   for(size_t t=at+4;t+4<=end && memcmp(file+t,"ENDT",4);) {
-   if(t+6>end)return nil;
+   if(t+6>end)return false;
    uint16_t n;memcpy(&n,file+t+4,2);const uint8_t *v=file+t+6;
-   if(n>end-(t+6))return nil;
+   if(n>end-(t+6))return false;
    if(!memcmp(file+t,"NAME",4))entry.assign((const char *)v,strnlen((const char *)v,n));
    else if(!memcmp(file+t,"TYPE",4) && n>=1)type=v[0];
    t+=6+n;
   }
-  if(entry==wanted) {
-   if(type!=5)return nil;
-   NBFunction *function=[NBFunction new];function.name=name;function.functionType=(MTLFunctionType)4;function.library=library;
-   return function;
-  }
+  if(!visit(entry,type))return true;
   at=end;
  }
- return nil;
+ return true;
+}
+static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
+ const uint8_t *file=library.bytes;const char *wanted=name.UTF8String;
+ if(!file || !wanted || library.length<88 || file[10]!=1)return nil;
+ NBFunction *found=nil;
+ forEachLibraryEntry(library,[&](const std::string &entry,int type) {
+  if(entry!=wanted)return true;
+  if(type==5) {
+   found=[NBFunction new];found.name=name;found.functionType=(MTLFunctionType)4;found.library=library;
+  }
+  return false;
+ });
+ return found;
 }
 @interface NBComputePipeline : NBObject
 @property(nonatomic) NmbComputePipeline *handle;
@@ -2809,6 +2864,11 @@ static void completed(void *context) {
  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
  {
   const uint64_t took=nowUs()-commandBuffer.committedUs;
+  {
+   const bool frame=commandBuffer->encodedWork.pixels>=2000000;
+   histAdd(frame?gHistFrameGpu:gHistOtherGpu,took);
+   if(frame)histAdd(gHistFrameEncode,commandBuffer.committedUs-commandBuffer->createdUs);
+  }
   gTimeEncodeToCommit.count++;gTimeEncodeToCommit.total+=took;
   uint64_t seen=gTimeEncodeToCommit.slowest.load();while(took>seen && !gTimeEncodeToCommit.slowest.compare_exchange_weak(seen,took)){}
   std::lock_guard<std::mutex> lock(gCommitLock);
@@ -4189,6 +4249,13 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)gTimeFunction.count.load(),ms(gTimeFunction.total.load()),ms(gTimeFunction.slowest.load()));
  row("G commit-to-complete n=%llu total=%llums max=%llums mean=%lluus",(unsigned long long)gTimeEncodeToCommit.count.load(),ms(gTimeEncodeToCommit.total.load()),
   ms(gTimeEncodeToCommit.slowest.load()),(unsigned long long)(gTimeEncodeToCommit.count.load()?gTimeEncodeToCommit.total.load()/gTimeEncodeToCommit.count.load():0));
+ for(int k=0;k<3;k++) {
+  const std::atomic<uint64_t> *bins=k==0?gHistFrameGpu:k==1?gHistOtherGpu:gHistFrameEncode;
+  row("H %s <1=%llu <2=%llu <4=%llu <8=%llu <16=%llu <32=%llu <64=%llu <128=%llu <256=%llu more=%llu",k==0?"frame-gpu":k==1?"other-gpu":"frame-enc",
+   (unsigned long long)bins[0].load(),(unsigned long long)bins[1].load(),(unsigned long long)bins[2].load(),(unsigned long long)bins[3].load(),
+   (unsigned long long)bins[4].load(),(unsigned long long)bins[5].load(),(unsigned long long)bins[6].load(),(unsigned long long)bins[7].load(),
+   (unsigned long long)bins[8].load(),(unsigned long long)bins[9].load());
+ }
  row("J scheduled wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitScheduled.count.load(),ms(gTimeWaitScheduled.total.load()),ms(gTimeWaitScheduled.slowest.load()));
  row("J completed wait n=%llu total=%llums max=%llums t=%llu",(unsigned long long)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()),(unsigned long long)gWaitTimeouts.load());
  row("J resource wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));
@@ -4214,6 +4281,13 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   if(nmb_device_texture_counts(gDevice,tc))
    row("L inp %llu/%llu rf %llu/%llu sh %llu cp %llu bk %llu rt %llu",(unsigned long long)tc[0],(unsigned long long)tc[1],(unsigned long long)tc[2],
     (unsigned long long)tc[3],(unsigned long long)tc[4],(unsigned long long)tc[5],(unsigned long long)tc[6],(unsigned long long)tc[7]);
+  // Textures over host pages at rows or offsets this GPU's linear images cannot take: how many, MiB, the largest and who made it.
+  {
+   std::lock_guard<std::mutex> lock(gUnalignedLock);
+   if(gUnalignedCount)
+    row("TB n%llu %lluM big %ux%u row%u %.20s+%llx",(unsigned long long)gUnalignedCount,(unsigned long long)(gUnalignedBytes>>20),
+     gUnalignedSize[0],gUnalignedSize[1],gUnalignedSize[2],gUnalignedImage,(unsigned long long)gUnalignedCaller);
+  }
   // Where passes cost more than one pass in tile memory: passes begun as instances, split inline; instance splits for a barrier, tile
   // memory, a memoryless write, a pending pipeline; stand-ins made and MiB; stand-in copies, of them at draws.
   uint64_t pc[10]={};
@@ -4236,11 +4310,23 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
     (unsigned long long)mc[8],(unsigned long long)mc[9],(unsigned long long)(bc[5]>>20),(unsigned long long)(bc[6]>>20),
     (unsigned long long)bc[2],(unsigned long long)bc[3]);
   }
-  // Who allocated the device memory (4 MiB or more at once): the six call stacks with the most bytes, as MiB, allocations and return
+  // How Turnip rendered the passes (tu_render_mode_stats): GMEM passes and their Mpx, SYSMEM passes the autotuner chose and theirs,
+  // SYSMEM passes for another reason and theirs, then GMEM passes with an attachment loaded or stored over its texels alone.
+  {
+   uint64_t rm[8]={};
+   static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
+   static void (*modeStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_render_mode_stats"):nullptr;
+   if(modeStats) {
+    modeStats(rm);
+    row("RM gmem %llu %lluM | sys auto %llu %lluM other %llu %lluM | exact %llu",(unsigned long long)rm[0],(unsigned long long)(rm[1]/1000),
+     (unsigned long long)rm[2],(unsigned long long)(rm[3]/1000),(unsigned long long)rm[4],(unsigned long long)(rm[5]/1000),(unsigned long long)rm[6]);
+   }
+  }
+  // Who allocated the device memory (4 MiB or more at once): the three call stacks with the most bytes, as MiB, allocations and return
   // addresses relative to their image (+offset in the plugin, whose link map NativeAdrenoMetal.map names them; *offset in another).
   {
-   uint64_t sites[6*12]={};
-   const size_t n=nmb_allocation_sites(sites,6);
+   uint64_t sites[3*12]={};
+   const size_t n=nmb_allocation_sites(sites,3);
    for(size_t i=0;i<n;++i) {
     const uint64_t *site=sites+i*12;
     char frames[10][12]={};
@@ -4257,19 +4343,13 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
     row("MA%zub %s %s %s %s %s",i,frames[5],frames[6],frames[7],frames[8],frames[9]);
    }
   }
-  // The pipeline caches compiled ahead on the host, read on demand from the userdata import region (the plugin's CacheImport.h).
-  if((native_cache_import_stats[0]||native_cache_import_stats[2]||native_cache_import_stats[3])) {
-   row("CI hit%llu KiB%llu miss%llu fail%llu",(unsigned long long)native_cache_import_stats[0],(unsigned long long)(native_cache_import_stats[1]>>10),
-    (unsigned long long)native_cache_import_stats[2],(unsigned long long)native_cache_import_stats[3]);
-   if(native_cache_import_first_miss[0])row("CIm %.86s",native_cache_import_first_miss+(strlen(native_cache_import_first_miss)>86?strlen(native_cache_import_first_miss)-86:0));
-  }
   char warning[200];size_t n=nmb_last_warning(warning,sizeof warning);
   if(n){row("W %.86s",warning);if(n>86)row("Wb %.86s",warning+86);}
  }
  {
   std::lock_guard<std::mutex> lock(gProblemLock);
   char formats[160];native_bridge_metal_formats_locked(formats,sizeof formats);row("F %.86s",formats);
-  row("PR compiling=%u libs=%u/%u made=%u rate=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate);
+  row("PR compiling=%u libs=%u/%u made=%u rate=%u resumed=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate,native_prime_functions_resumed);
   const SurfaceRefusal &r=gSurfaceLastRefusal;
   if(r.step)row("SR %u %08x %c%c%c%c pl%u/%u o%llx rb%llu a%llx %llux%llu pf%u",r.step,r.format,(char)(r.format>>24),(char)(r.format>>16),(char)(r.format>>8),
    (char)r.format,r.plane,r.planes,(unsigned long long)r.offset,(unsigned long long)r.row,(unsigned long long)r.allocation,(unsigned long long)r.width,

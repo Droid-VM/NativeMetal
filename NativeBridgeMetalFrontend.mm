@@ -857,22 +857,19 @@ static void watchImportPressure() {
   dispatch_activate(source);
  });
 }
-// The runtime's kept empty memory blocks go once the process has committed nothing for two seconds (those empty for one second or
-// more), and all of them on memory pressure (watchImportPressure): it keeps the last empty block of each memory pool for its next
-// placements however long the process stays idle, and on this guest every block is wired memory -- the render server held 136 MiB of
-// them at the home screen, a wallpaper or widget renderer its own.
+// The runtime's kept empty memory blocks that have stayed empty for two seconds go, every two seconds, and all of them on memory
+// pressure (watchImportPressure): it keeps the last empty block of each memory pool for its next placements however long it stays
+// empty, and on this guest every block is wired memory -- the render server held 72-136 MiB of them at the home screen, a wallpaper or
+// widget renderer its own. A pool whose placements come each frame refills its kept block within the frame, so only blocks no frame
+// asked for in two seconds go. (Waiting for the process to commit nothing for two seconds never trimmed the render server: the home
+// screen's clock keeps it drawing.)
 static void watchIdleMemory() {
  static dispatch_once_t once;
  dispatch_once(&once,^{
   dispatch_source_t timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
   if(!timer)return;
   dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),2*NSEC_PER_SEC,250*NSEC_PER_MSEC);
-  __block uint64_t seen=0;
-  dispatch_source_set_event_handler(timer,^{
-   const uint64_t commits=gCommits.load();
-   if(commits==seen && gDevice)gTrimmedBlocks+=nmb_device_trim_memory(gDevice,1000);
-   seen=commits;
-  });
+  dispatch_source_set_event_handler(timer,^{if(gDevice)gTrimmedBlocks+=nmb_device_trim_memory(gDevice,2000);});
   dispatch_activate(timer);
  });
 }

@@ -1792,18 +1792,28 @@ struct EncodeThread {
 };
 static thread_local bool tOnEncodeThread;
 static thread_local EncodeBatch *tBatch;
+// /private/var/ngpu/debug/encode-priority (read when the process starts): the thread takes the scheduling policy and priority of the
+// thread that first hands it work (the render server's CoreAnimation thread, 54-55) instead of the user-interactive QoS (37-46 in
+// backboardd). A frame reached the GPU about 3 ms after CoreAnimation committed it, the thread still translating the frame's calls:
+// on the guest's slower cores (capacity 762 against 1024) that was the GPU's idle time between frames.
+static const bool gEncodePriority=access("/private/var/ngpu/debug/encode-priority",F_OK)==0;
+static int gEncodePolicy=SCHED_OTHER;static sched_param gEncodeParam={};
+static std::atomic<int> gEncodePriorityStatus{-1};
 static EncodeThread &encodeThread() {
  static EncodeThread *thread=[]{
   EncodeThread *t=new EncodeThread;
   pthread_t id;pthread_attr_t attr;pthread_attr_init(&attr);
-  pthread_attr_set_qos_class_np(&attr,QOS_CLASS_USER_INTERACTIVE,0);
+  if(gEncodePriority)pthread_getschedparam(pthread_self(),&gEncodePolicy,&gEncodeParam);
+  else pthread_attr_set_qos_class_np(&attr,QOS_CLASS_USER_INTERACTIVE,0);
   pthread_create(&id,&attr,[](void *arg)->void * {
    EncodeThread &t=*(EncodeThread *)arg;tOnEncodeThread=true;
    pthread_setname_np("native-metal-encode");
+   if(gEncodePriority)gEncodePriorityStatus=pthread_setschedparam(pthread_self(),gEncodePolicy,&gEncodeParam);
    std::unique_lock<std::mutex> lock(t.lock);
    for(;;) {
     t.work.wait(lock,[&]{return !t.batches.empty();});
     EncodeBatch *batch=t.batches.front();t.batches.pop_front();
+    if(gEncodePriority){static bool said;if(!said){said=true;NBLOG(@"native-metal: encode thread policy %d priority %d: %d",gEncodePolicy,gEncodeParam.sched_priority,gEncodePriorityStatus.load());}}
     lock.unlock();
     @autoreleasepool {batch->run();}
     lock.lock();t.spare.push_back(batch);t.done++;t.idle.notify_all();

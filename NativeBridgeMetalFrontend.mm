@@ -1792,19 +1792,22 @@ struct EncodeThread {
 };
 static thread_local bool tOnEncodeThread;
 static thread_local EncodeBatch *tBatch;
-// /private/var/ngpu/debug/encode-priority (read when the process starts): the thread takes the scheduling policy and priority of the
-// thread that first hands it work (the render server's CoreAnimation thread, 54-55) instead of the user-interactive QoS (37-46 in
+// /private/var/ngpu/debug/encode-priority (read when the process starts): the thread runs round-robin at the fixed priority the file
+// holds (54 when empty: the render server's CoreAnimation display thread's) instead of the user-interactive QoS (37-46 in
 // backboardd). A frame reached the GPU about 3 ms after CoreAnimation committed it, the thread still translating the frame's calls:
-// on the guest's slower cores (capacity 762 against 1024) that was the GPU's idle time between frames.
+// on the guest's slower cores (capacity 762 against 1024) that was the GPU's idle time between frames. (Copying the first caller's
+// pthread policy gave 31: CoreAnimation's threads are not set through it.)
 static const bool gEncodePriority=access("/private/var/ngpu/debug/encode-priority",F_OK)==0;
-static int gEncodePolicy=SCHED_OTHER;static sched_param gEncodeParam={};
+static int gEncodePolicy=SCHED_RR;static sched_param gEncodeParam={};
 static std::atomic<int> gEncodePriorityStatus{-1};
 static EncodeThread &encodeThread() {
  static EncodeThread *thread=[]{
   EncodeThread *t=new EncodeThread;
   pthread_t id;pthread_attr_t attr;pthread_attr_init(&attr);
-  if(gEncodePriority)pthread_getschedparam(pthread_self(),&gEncodePolicy,&gEncodeParam);
-  else pthread_attr_set_qos_class_np(&attr,QOS_CLASS_USER_INTERACTIVE,0);
+  if(gEncodePriority) {
+   gEncodeParam.sched_priority=54;
+   if(FILE *f=fopen("/private/var/ngpu/debug/encode-priority","r")){int p=0;if(fscanf(f,"%d",&p)==1 && p>0 && p<128)gEncodeParam.sched_priority=p;fclose(f);}
+  } else pthread_attr_set_qos_class_np(&attr,QOS_CLASS_USER_INTERACTIVE,0);
   pthread_create(&id,&attr,[](void *arg)->void * {
    EncodeThread &t=*(EncodeThread *)arg;tOnEncodeThread=true;
    pthread_setname_np("native-metal-encode");

@@ -1868,8 +1868,20 @@ static bool available() {
  }();
  return ok;
 }
-static uint64_t take() {return available()?call(0):0;}
+// Only a display thread's commits (com.apple.coreanimation.display.*: the frame its swap shows next); the render server's other
+// work waits as Metal says.
+static bool displayThread() {
+ static thread_local int answer=-1;
+ if(answer<0){char name[64]={};pthread_getname_np(pthread_self(),name,sizeof name);answer=!strncmp(name,"com.apple.coreanimation.display.",32);}
+ return answer;
+}
+static uint64_t take() {return displayThread() && available()?call(0):0;}
 static void end(std::atomic<uint64_t> &ticket) {if(const uint64_t t=ticket.exchange(0))call(t);}
+// The last commit that returned before its submission. The next one waits for it to be submitted: a frame's runtime work overlaps
+// the next frame's CoreAnimation work, and no more (without it the display thread went on a frame each refresh while the encoding
+// thread fell further behind).
+static std::mutex gDeferredLock;
+static NBCommandBuffer *gDeferred;
 }
 // Held while a resource wait reads an in-flight command buffer's runtime handle and while a locally refused command buffer frees it.
 static std::mutex gRuntimeHandleLock;
@@ -2631,7 +2643,14 @@ static char kUserDictionaryKey;
 - (CFTimeInterval)kernelEndTime {return 0;}
 - (BOOL)commitAndWaitUntilSubmitted {
  if(!self.committed && !onEncodeQueue())
-  if(const uint64_t ticket=displayhold::take()){holdTicket=ticket;[(id<MTLCommandBuffer>)self commit];return YES;}
+  if(const uint64_t ticket=displayhold::take()){
+   holdTicket=ticket;
+   [(id<MTLCommandBuffer>)self commit];
+   NBCommandBuffer *previous;
+   {std::lock_guard<std::mutex> lock(displayhold::gDeferredLock);previous=displayhold::gDeferred;displayhold::gDeferred=self;}
+   if(previous)dispatch_group_wait(previous.schedulingHandlers,DISPATCH_TIME_FOREVER);
+   return YES;
+  }
  [(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;
 }
 - (CFTimeInterval)GPUStartTime {return self.submitted && !self.failedLocally?nmb_command_buffer_gpu_time(_handle,false):0;}

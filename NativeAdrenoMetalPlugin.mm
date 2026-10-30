@@ -17,12 +17,37 @@
 #include <pwd.h>
 #include <fts.h>
 #include <mach/mach.h>
+#include <sys/sysctl.h>
 #include <objc/message.h>
 #include "NativeAdrenoUserTest.h"
 #include "NativeMetalBridgePhase.h"
 #include "CacheExport.h"
 #include "PrimeShaders.h"
 #include "ExceptionDiag.h"
+
+// The kernel boot argument ca-triple-buffer=1 sets the render server's CA_FORCE_TRIPLE_BUFFERED_LATENCY, as Droid-VM/macOS-DroidVM's
+// plugin sets WindowServer's: CoreAnimation renders a frame ahead (a frame of presentation latency) instead of starting each frame
+// only after the last one's buffer came back, which it does whenever a frame took longer than a refresh -- and a frame's GPU work
+// returns 8-12 ms after its commit through a virtual GPU. The option's index is found by its name (CAGetDebugOptionEnvVariableName;
+// 200 in iPadOS 27's QuartzCore, 198 in macOS 27's), so a QuartzCore that numbers its options otherwise is not given another one.
+__attribute__((constructor)) static void tripleBufferFromBootArgs() {
+    char args[1024] = {};
+    size_t size = sizeof(args) - 1;
+    if (strcmp(getprogname(), "backboardd") || sysctlbyname("kern.bootargs", args, &size, nullptr, 0) || !strstr(args, "ca-triple-buffer=1"))
+        return;
+    auto name = reinterpret_cast<const char *(*)(unsigned)>(dlsym(RTLD_DEFAULT, "CAGetDebugOptionEnvVariableName"));
+    auto setOption = reinterpret_cast<void (*)(unsigned, bool)>(dlsym(RTLD_DEFAULT, "CASetDebugOption"));
+    setenv("CA_FORCE_TRIPLE_BUFFERED_LATENCY", "1", 1);   // for an options read after this one
+    if (!name || !setOption) return;
+    for (unsigned option = 0; option < 1024; ++option) {
+        const char *text = name(option);
+        if (text && !strcmp(text, "CA_FORCE_TRIPLE_BUFFERED_LATENCY")) {
+            setOption(option, true);
+            fprintf(stderr, "NativeAdrenoMetal: CA_FORCE_TRIPLE_BUFFERED_LATENCY (option %u) set\n", option);
+            return;
+        }
+    }
+}
 
 @interface _MTLDevice : NSObject
 @end

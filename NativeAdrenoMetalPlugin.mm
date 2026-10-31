@@ -284,6 +284,11 @@ static id deviceForPort(unsigned port) {
             if (confstr(_CS_DARWIN_USER_TEMP_DIR, log, sizeof log - 16)) {strlcat(log, "mesa.log", sizeof log); setenv("MESA_LOG_FILE", log, 1);}
             setenv("MESA_VK_ABORT_ON_DEVICE_LOSS", "1", 1);
         }
+        // A/B: while /private/var/ngpu/debug/no-inline-memoryless exists when the process opens its device, a render pass with a
+        // memoryless color records its first instance in a secondary (fork patches/metal2vulkan/0014, METAL2VULKAN_INLINE_MEMORYLESS=0),
+        // so a later draw that writes the color no longer splits the pass: Core Animation's 2048x2732 frame passes split so at almost
+        // every frame (the PS row's ml), storing and loading the whole frame again on the tiler.
+        if (access("/private/var/ngpu/debug/no-inline-memoryless", F_OK) == 0) setenv("METAL2VULKAN_INLINE_MEMORYLESS", "0", 1);
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {

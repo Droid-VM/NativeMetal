@@ -4144,11 +4144,21 @@ static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
 static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}
 static BOOL flagArgAnswer(id,SEL cmd,NSUInteger arg) {return askAnswer(cmd,arg)!=0;}
 static BOOL (*gFamilyAnswer)(id,SEL,NSInteger);
+// Whether the code at a return address is RenderBox's, looked up once per address: dladdr searches the image's symbol table, and
+// QuartzCore's pixel-format queries ask supportsFamily: for every surface it makes (a masked corner, a backdrop, a blur's mips) and every
+// IOSurface it checks -- the render server's display thread spent 15% of its running time in that search during page swipes.
+static bool callerIsRenderBox(void *address) {
+ static std::mutex lock;
+ static std::unordered_map<void *,bool> known;
+ {std::lock_guard<std::mutex> hold(lock);auto found=known.find(address);if(found!=known.end())return found->second;}
+ Dl_info caller;
+ const bool renderBox=dladdr(address,&caller) && caller.dli_fname && strstr(caller.dli_fname,"/RenderBox.framework/");
+ std::lock_guard<std::mutex> hold(lock);
+ if(known.size()<4096)known.emplace(address,renderBox);
+ return renderBox;
+}
 static BOOL familyForCaller(id self,SEL _cmd,NSInteger family) {
- if(family>=1003 && family<2000) {   // MTLGPUFamilyApple3 and up
-  Dl_info caller;
-  if(dladdr(__builtin_return_address(0),&caller) && caller.dli_fname && strstr(caller.dli_fname,"/RenderBox.framework/"))return NO;
- }
+ if(family>=1003 && family<2000 && callerIsRenderBox(__builtin_return_address(0)))return NO;   // MTLGPUFamilyApple3 and up
  return gFamilyAnswer(self,_cmd,family);
 }
 static void installAnswers(Class cls) {

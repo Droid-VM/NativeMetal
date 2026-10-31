@@ -3866,11 +3866,30 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);[texture countUse];return (id<MTLTexture>)texture;
 }
+// One L line per library made (its source, size and function names), and with /private/var/ngpu/debug/dump-libraries each library made
+// from data written beside the journal (libs/<size>-<hash>.metallib): RenderBox links a function of a library it builds at run time
+// (clampedPlusL_v1, which its fragment functions call as custom_blend), and only its bytes say which name its module defines.
+static void journalLibrary(NmbLibrary *handle,const char *source,const void *bytes,size_t size) {
+ if(gJournalPath.empty())return;
+ char head[64];snprintf(head,sizeof head,"L size=%zu src=",size);
+ std::string line=std::string(head)+source+" fns=";
+ for(uint32_t i=0,n=nmb_library_function_count(handle);i<n && i<64;i++){char name[256]={};nmb_library_function_name(handle,i,name,sizeof name);line+=(i?",":"");line+=name;}
+ static const bool dump=access("/private/var/ngpu/debug/dump-libraries",F_OK)==0;
+ if(dump && bytes && !strcmp(source,"data")) {
+  uint64_t hash=1469598103934665603ull;for(size_t i=0;i<size;i++)hash=(hash^((const uint8_t *)bytes)[i])*1099511628211ull;
+  const std::string dir=gJournalPath.substr(0,gJournalPath.rfind('/'))+"/libs";mkdir(dir.c_str(),0755);
+  char path[96];snprintf(path,sizeof path,"/%zu-%016llx.metallib",size,(unsigned long long)hash);
+  const std::string file=dir+path;
+  if(access(file.c_str(),F_OK)!=0)if(FILE *f=fopen(file.c_str(),"w")){fwrite(bytes,1,size,f);fclose(f);line+=" dumped="+file;}
+ }
+ journal(line);
+}
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
+ journalLibrary(handle,"data",bytes,size);
  NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=mapped;library.bytes=(const uint8_t *)bytes;library.length=size;
  if(error)*error=nil;return (id<MTLLibrary>)library;
 }
@@ -3879,6 +3898,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
+ journalLibrary(handle,(std::string("file:")+path.UTF8String).c_str(),nullptr,bytes.length);
  NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=bytes;library.bytes=(const uint8_t *)bytes.bytes;library.length=bytes.length;
  if(error)*error=nil;return (id<MTLLibrary>)library;
 }

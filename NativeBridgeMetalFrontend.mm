@@ -4054,9 +4054,15 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
   // The tail of the text (what a client's problem row keeps) names the fragment function, the linked functions given and the compiler's
   // state: a missing linked function there is RenderBox's stitched custom_blend, which needs the compiler.
   // linked: the fragment stage's linked functions, public+private; preloaded: its dynamic libraries, which this file does not pass on.
-  NSString *why=[NSString stringWithFormat:@"%@ | frag %@ linked %lu+%lu preloaded %lu stitched %u/%u compiler %s",lastError(),d.fragmentFunction.name,
+  // ... and the linked functions' names: a symbol the runtime asks for that none of them is named (RenderBox's custom_blend, given
+  // as one private function) says which name the caller's function has instead.
+  NSMutableArray<NSString *> *names=[NSMutableArray array];
+  for(id<MTLFunction> f in d.fragmentLinkedFunctions.functions)[names addObject:f.name?:@"?"];
+  for(id<MTLFunction> f in d.fragmentLinkedFunctions.privateFunctions)[names addObject:[@"private:" stringByAppendingString:f.name?:@"?"]];
+  NSString *why=[NSString stringWithFormat:@"%@ | frag %@ linked %lu+%lu (%@) preloaded %lu stitched %u/%u compiler %s",lastError(),d.fragmentFunction.name,
       (unsigned long)d.fragmentLinkedFunctions.functions.count,(unsigned long)d.fragmentLinkedFunctions.privateFunctions.count,
-      (unsigned long)d.fragmentPreloadedLibraries.count,gStitchMade.load(),gStitchMade.load()+gStitchFailed.load(),gCompilerLoaded];
+      [names componentsJoinedByString:@","],(unsigned long)d.fragmentPreloadedLibraries.count,gStitchMade.load(),
+      gStitchMade.load()+gStitchFailed.load(),gCompilerLoaded];
   static std::atomic<int> told{0};
   if(told.fetch_add(1)<64)NBLOG(@"native-metal: render pipeline refused: %@",why);else noteProblem([@"render pipeline: " stringByAppendingString:why]);
   if(error)*error=nbError([@"render pipeline: " stringByAppendingString:why]);

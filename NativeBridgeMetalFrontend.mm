@@ -4001,10 +4001,21 @@ static void journalLibrary(NmbLibrary *handle,const char *source,const void *byt
 - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function error:(NSError **)error {
  return [(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:MTLPipelineOptionNone reflection:nil error:error];
 }
+// A refused compute pipeline in the unified log (public) and the client's row, the first 64 of a process: Core Image's program creation
+// returned null in iconservicesagent with every render pipeline made, and a compute refusal was only ever a row (the client table was full).
+static void computeRefused(id<MTLFunction> function,NSString *why) {
+ static std::atomic<int> told{0};
+ NBFunction *f=[(id)function isKindOfClass:[NBFunction class]]?(NBFunction *)function:nil;
+ NSString *text=[NSString stringWithFormat:@"native-metal: compute pipeline refused: %@ k=%s: %@",function.name?:@"?",f?f.constantsText.c_str():"",why];
+ if(told.fetch_add(1)<64)NBLOG(@"%@",text);else noteProblem(text);
+}
 - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
                                                          reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
  if(reflection)*reflection=nil;
- if(![(id)function isKindOfClass:[NBFunction class]] || ![(NBFunction *)function handle]){if(error)*error=nbError(@"foreign function");return nil;}
+ if(![(id)function isKindOfClass:[NBFunction class]] || ![(NBFunction *)function handle]) {
+  computeRefused(function,[(id)function isKindOfClass:[NBFunction class]]?@"a function with no runtime handle (a Core Image kernel, only stitched)":@"foreign function");
+  if(error)*error=nbError(@"foreign function");return nil;
+ }
  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
  const uint64_t pipelineBegan=nowUs();
  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);
@@ -4014,8 +4025,7 @@ static void journalLibrary(NmbLibrary *handle,const char *source,const void *byt
  }
  gTimePipeline.add(pipelineBegan);
  if(!handle) {
-  NBFunction *f=(NBFunction *)function;
-  noteProblem([NSString stringWithFormat:@"compute %@ k=%s: %@",f.name,f.constantsText.c_str(),lastError()]);
+  computeRefused(function,lastError());
   return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
  }
  if(reflection && wantsReflection(options)) {
@@ -4028,7 +4038,7 @@ static void journalLibrary(NmbLibrary *handle,const char *source,const void *byt
                                                        reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
  if(reflection)*reflection=nil;
  NmbComputePipelineDescriptor p={};std::vector<NmbFunction *> linked,privateLinked;
- if(!computeDescriptor(d,&p,linked,privateLinked,error))return nil;
+ if(!computeDescriptor(d,&p,linked,privateLinked,error)){computeRefused(d.computeFunction,error && *error?(*error).localizedDescription:@"descriptor");return nil;}
  std::vector<NmbBinaryArchive *> archives;
  if(!pipelineArchives(d.binaryArchives,archives,error))return nil;
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
@@ -4041,8 +4051,7 @@ static void journalLibrary(NmbLibrary *handle,const char *source,const void *byt
  }
  gTimePipeline.add(pipelineBegan);
  if(!handle) {
-  NBFunction *f=(NBFunction *)d.computeFunction;
-  noteProblem([NSString stringWithFormat:@"compute %@ k=%s: %@",f.name,f.constantsText.c_str(),lastError()]);
+  computeRefused(d.computeFunction,lastError());
   return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
  }
  if(reflection && wantsReflection(options))*reflection=(MTLComputePipelineReflection *)computeReflection(&p);

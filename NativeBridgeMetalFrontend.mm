@@ -734,6 +734,123 @@ static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescripto
                    d?(uint32_t)d.pixelFormat:0,offset,row,surface?IOSurfaceGetAllocSize(surface):0,d?d.width:0,d?d.height:0,
                    surface?IOSurfaceGetWidth(surface):0,surface?IOSurfaceGetHeight(surface):0,textureRotation(d),textureFlag(d,"framebufferOnly")};
  std::lock_guard<std::mutex> lock(gProblemLock);gSurfaceLastRefusal=r;
+ // Bring-up: which surface is refused and why (WindowServer retries a layer's surface every frame): the first refusal of a surface ID,
+ // then every 1000th.
+ static uint32_t lastId;static uint64_t repeats;
+ const uint32_t id=surface?IOSurfaceGetID(surface):0;repeats=id==lastId?repeats+1:0;lastId=id;
+ if(!(repeats%1000))NSLog(@"native-metal: surface %#x refused at step %u: %c%c%c%c planes %u plane %u, %llux%llu, alloc %#llx, offset %#llx row %llu; "
+   "texture pf %u %llux%llu usage %#lx storage %lu (repeat %llu)",id,step,(char)(r.format>>24),(char)(r.format>>16),(char)(r.format>>8),(char)r.format,
+   r.planes,r.plane,(unsigned long long)r.surfaceWidth,(unsigned long long)r.surfaceHeight,(unsigned long long)r.allocation,(unsigned long long)offset,
+   (unsigned long long)row,r.pixelFormat,(unsigned long long)r.width,(unsigned long long)r.height,d?(unsigned long)d.usage:0ul,d?(unsigned long)d.storageMode:0ul,
+   (unsigned long long)repeats);
+}
+// A large two-plane YCbCr texture over a surface (WindowServer's 4096x2160 wallpapers: the login window's '444f' as YCBCR8_444_2P, the
+// desktop's 'x420' as YCBCR10_420_2P and RGB10_420_2P) is converted here, once per surface contents, into an RGBA8 or RGB10A2 texture of
+// what Metal reads. The runtime's own texture of it is an RGBA16F image of the converted texels plus a staging copy of the planes
+// (about 100 MiB at 4K) per texture made, and the server makes one at every frame it is refused: refused, the wallpaper layer is never
+// drawn, and the screen keeps whatever a window left where the desktop shows again. The cache answers the same texture while the
+// surface's seed is unchanged (a new one when it changes, the old one left to the command buffers that hold it). Formats: the converted
+// 8-bit 500, 502, 503 (RGBA8) and their _sRGB twins 520, 522, 523 (an _sRGB texture of the same bytes), the converted 10-bit 505, 506,
+// 507 (RGB10A2), and the code formats 540, 541, 542 and 543, 544, 545 (red Cr, green Y, blue Cb; RGBA8 and RGB10A2), for a texture the
+// shaders only read. The matrix is the surface's IOSurfaceYCbCrMatrix (BT.601 without one, as Metal), the range its OSType's ('...f'
+// full, else video); 10-bit codes are the high 10 bits of 16-bit words.
+struct ConvertedYCbCr {uint32_t surface,seed,format;__strong id<MTLTexture> texture;};
+static std::mutex gConvertedLock;
+static ConvertedYCbCr gConverted[4];
+static std::atomic<uint64_t> gConvertedMade,gConvertedReused;
+static id<MTLTexture> convertedYCbCrTexture(id device,MTLTextureDescriptor *d,IOSurfaceRef surface,NSUInteger plane) {
+ const NSUInteger f=d.pixelFormat;
+ // sub: 2 4:2:0, 1 4:2:2, 0 4:4:4 (the format's last digit after 500/505/520/540/543: 0, 2, 3 / 0, 1, 2)
+ unsigned sub=3,bits=8;bool codes=false,srgb=false;
+ switch(f) {
+  case 500: case 520: sub=2;break;
+  case 502: case 522: sub=1;break;
+  case 503: case 523: sub=0;break;
+  case 505: sub=2;bits=10;break;
+  case 506: sub=1;bits=10;break;
+  case 507: sub=0;bits=10;break;
+  case 540: sub=2;codes=true;break;
+  case 541: sub=1;codes=true;break;
+  case 542: sub=0;codes=true;break;
+  case 543: sub=2;bits=10;codes=true;break;
+  case 544: sub=1;bits=10;codes=true;break;
+  case 545: sub=0;bits=10;codes=true;break;
+ }
+ srgb=f>=520 && f<=523;
+ const size_t unit=bits==8?1:2;
+ if(sub==3 || plane || IOSurfaceGetPlaneCount(surface)!=2 || (uint64_t)d.width*d.height<=1024*1024 || d.textureType!=MTLTextureType2D ||
+    (d.usage&~(NSUInteger)(MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView)))return nil;
+ const size_t w=IOSurfaceGetWidthOfPlane(surface,0),h=IOSurfaceGetHeightOfPlane(surface,0);
+ if(w!=d.width || h!=d.height || IOSurfaceGetBytesPerElementOfPlane(surface,0)!=unit || IOSurfaceGetBytesPerElementOfPlane(surface,1)!=2*unit ||
+    IOSurfaceGetWidthOfPlane(surface,1)<(w+(sub?1:0))>>(sub?1:0) || IOSurfaceGetHeightOfPlane(surface,1)<(h+(sub==2?1:0))>>(sub==2?1:0))return nil;
+ const uint32_t sid=IOSurfaceGetID(surface),seed=IOSurfaceGetSeed(surface);
+ {
+  std::lock_guard<std::mutex> lock(gConvertedLock);
+  for(ConvertedYCbCr &entry:gConverted)
+   if(entry.texture && entry.surface==sid && entry.seed==seed && entry.format==f){gConvertedReused++;return entry.texture;}
+ }
+ const uint32_t ostype=IOSurfaceGetPixelFormat(surface);
+ const bool full=(ostype&0xff)=='f';
+ double kr=0.299,kb=0.114;
+ if(CFTypeRef value=IOSurfaceCopyValue(surface,CFSTR("IOSurfaceYCbCrMatrix"))) {
+  if(CFGetTypeID(value)==CFStringGetTypeID()) {
+   if(CFEqual(value,CFSTR("ITU_R_709_2")) || CFEqual(value,CFSTR("SMPTE_240M_1995"))){kr=0.2126;kb=0.0722;}
+   else if(CFEqual(value,CFSTR("ITU_R_2020"))){kr=0.2627;kb=0.0593;}
+  }
+  CFRelease(value);
+ }
+ // Codes to the output's channels in 16.16 fixed point: y' from the luma's range, each chroma about its middle, then the matrix; the
+ // code formats read each code alone, code / (2^bits - 1).
+ const unsigned levels=1u<<bits,top=levels-1,scale=bits==8?255:1023;
+ const double kg=1-kr-kb,mid=levels/2,yo=full?0:16<<(bits-8),ys=full?1.0/top:1.0/(219<<(bits-8)),cs=full?1.0/top:1.0/(224<<(bits-8));
+ std::vector<int32_t> table((size_t)levels*5);
+ int32_t *yT=table.data(),*rCr=yT+levels,*gCb=rCr+levels,*gCr=gCb+levels,*bCb=gCr+levels;
+ for(unsigned i=0;i<levels;i++) {
+  const double y=codes?(double)i/top:(i-yo)*ys,c=(i-mid)*cs;
+  yT[i]=(int32_t)lround(y*scale*65536);
+  rCr[i]=(int32_t)lround((codes?(double)i/top:2*(1-kr)*c)*scale*65536);bCb[i]=(int32_t)lround((codes?(double)i/top:2*(1-kb)*c)*scale*65536);
+  gCb[i]=codes?0:(int32_t)lround(-2*(1-kb)*kb/kg*c*scale*65536);gCr[i]=codes?0:(int32_t)lround(-2*(1-kr)*kr/kg*c*scale*65536);
+ }
+ const MTLPixelFormat out=bits==8?(srgb?MTLPixelFormatRGBA8Unorm_sRGB:MTLPixelFormatRGBA8Unorm):MTLPixelFormatRGB10A2Unorm;
+ MTLTextureDescriptor *rgba=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:out width:w height:h mipmapped:NO];
+ rgba.usage=MTLTextureUsageShaderRead;
+ id<MTLTexture> texture=[device newTextureWithDescriptor:rgba];
+ if(!texture)return nil;
+ std::vector<uint32_t> rows((size_t)w*64);
+ if(IOSurfaceLock(surface,kIOSurfaceLockReadOnly,nullptr))return nil;
+ const uint8_t *luma=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,0),*chroma=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,1);
+ const size_t lumaRow=IOSurfaceGetBytesPerRowOfPlane(surface,0),chromaRow=IOSurfaceGetBytesPerRowOfPlane(surface,1);
+ auto clamp=[scale](int32_t v)->uint32_t{v=(v+32768)>>16;return v<0?0u:(uint32_t)v>scale?scale:(uint32_t)v;};
+ const uint64_t began=nowUs();
+ for(size_t y0=0;y0<h;y0+=64) {
+  const size_t band=h-y0<64?h-y0:64;
+  for(size_t dy=0;dy<band;dy++) {
+   const uint8_t *yr=luma+(y0+dy)*lumaRow,*cr=chroma+((y0+dy)>>(sub==2?1:0))*chromaRow;
+   uint32_t *line=rows.data()+dy*w;
+   for(size_t x=0;x<w;x++) {
+    const size_t cx=x>>(sub?1:0);
+    unsigned Y,Cb,Cr;
+    if(bits==8){Y=yr[x];Cb=cr[cx*2];Cr=cr[cx*2+1];}
+    else{Y=((const uint16_t *)yr)[x]>>6;Cb=((const uint16_t *)cr)[cx*2]>>6;Cr=((const uint16_t *)cr)[cx*2+1]>>6;}
+    const int32_t L=yT[Y];
+    const uint32_t r=clamp(codes?rCr[Cr]:L+rCr[Cr]),g=clamp(L+gCb[Cb]+gCr[Cr]),b=clamp(codes?bCb[Cb]:L+bCb[Cb]);
+    line[x]=bits==8?r|g<<8|b<<16|0xff000000u:r|g<<10|b<<20|0xc0000000u;
+   }
+  }
+  [texture replaceRegion:MTLRegionMake2D(0,y0,w,band) mipmapLevel:0 withBytes:rows.data() bytesPerRow:w*4];
+ }
+ IOSurfaceUnlock(surface,kIOSurfaceLockReadOnly,nullptr);
+ gConvertedMade++;
+ NSLog(@"native-metal: surface %#x (%c%c%c%c seed %u) converted to a %zux%zu %s texture for format %lu in %llu ms (made %llu, reused %llu)",sid,
+  (char)(ostype>>24),(char)(ostype>>16),(char)(ostype>>8),(char)ostype,seed,w,h,bits==8?"RGBA8":"RGB10A2",(unsigned long)f,
+  (unsigned long long)((nowUs()-began)/1000),(unsigned long long)gConvertedMade.load(),(unsigned long long)gConvertedReused.load());
+ std::lock_guard<std::mutex> lock(gConvertedLock);
+ static unsigned next;
+ ConvertedYCbCr *slot=nullptr;   // the surface's own entry for this format (its contents changed), else the next in turn
+ for(ConvertedYCbCr &entry:gConverted)if(entry.texture && entry.surface==sid && entry.format==f)slot=&entry;
+ if(!slot)slot=&gConverted[next++%4];
+ slot->surface=sid;slot->seed=seed;slot->format=(uint32_t)f;slot->texture=texture;
+ return texture;
 }
 static void noteFormat(uint32_t format,bool made) {
  std::lock_guard<std::mutex> lock(gProblemLock);
@@ -4873,6 +4990,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  // the plane's own address and rows. Only a plain surface has no planes, and then only plane 0 exists.
  const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
  if(!surface || !d || (planes?plane>=planes:plane!=0)){refuseSurface(1,surface,d,plane,0,0);return nil;}
+ if(id<MTLTexture> converted=convertedYCbCrTexture(self,d,surface,plane))return converted;
  const uint64_t rotation=textureRotation(d);if(rotation<5)gSurfaceRotations[rotation]++;
  if(planes)gSurfacePlanar++;
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);

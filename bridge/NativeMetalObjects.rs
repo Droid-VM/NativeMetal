@@ -1513,6 +1513,78 @@ pub struct NmbComputePipelineDescriptor {
     pub linked_count: u64,
     pub private_linked: *const *mut NmbFunction,
     pub private_linked_count: u64,
+    pub preloaded: *const *mut NmbDynamicLibrary,
+    pub preloaded_count: u64,
+}
+
+/// A Metal dynamic library (`MTLDynamicLibrary`).
+pub struct NmbDynamicLibrary(metal2vulkan_runtime::DynamicLibrary);
+
+/// `newDynamicLibraryWithURL:error:`: the dynamic library in the file `path`. iPadOS 27's Core Image keeps its kernel language's
+/// standard library so (CoreImage.framework/CoreImage.metallib, every function exported); without it Core Image loaded none of its
+/// libraries ("Failed to load 'ci_stdlib' Metal library.") and crashed in program creation (iconservicesagent's icons went blank).
+///
+/// # Safety
+/// `path` is a C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_dynamic_library_new_with_url(device: *const NmbDevice, path: *const c_char) -> *mut NmbDynamicLibrary {
+    guard(std::ptr::null_mut(), || {
+        if path.is_null() {
+            return Err("null dynamic library path".into());
+        }
+        // SAFETY: the caller's contract.
+        let path = unsafe { CStr::from_ptr(path) }.to_str().map_err(e("dynamic library path"))?;
+        let library = get(device)?.0.new_dynamic_library_with_url(std::path::Path::new(path)).map_err(e("dynamic library"))?;
+        Ok(boxed(NmbDynamicLibrary(library)))
+    })
+}
+
+/// `newDynamicLibrary:error:`: `library`, of type dynamic, as a dynamic library.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_dynamic_library_new(device: *const NmbDevice, library: *const NmbLibrary) -> *mut NmbDynamicLibrary {
+    guard(std::ptr::null_mut(), || {
+        let library = get(device)?.0.new_dynamic_library(&get(library)?.0).map_err(e("dynamic library"))?;
+        Ok(boxed(NmbDynamicLibrary(library)))
+    })
+}
+
+/// `installName`, NUL-terminated into `out`; the length it needs.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_dynamic_library_install_name(library: *const NmbDynamicLibrary, out: *mut c_char, size: usize) -> usize {
+    guard(0, || {
+        let name = get(library)?.0.install_name().as_bytes().to_vec();
+        if !out.is_null() && size > 0 {
+            let n = name.len().min(size - 1);
+            // SAFETY: the caller's contract: `size` writable bytes at `out`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(name.as_ptr() as *const c_char, out, n);
+                *out.add(n) = 0;
+            }
+        }
+        Ok(name.len())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_dynamic_library_release(library: *mut NmbDynamicLibrary) {
+    release(library)
+}
+
+/// The dynamic libraries of a counted array of live handles, as a stage searches them.
+fn preloaded_list(libraries: *const *mut NmbDynamicLibrary, count: u64) -> Result<metal2vulkan::pipeline::DynamicLibraries, String> {
+    let mut out = metal2vulkan::pipeline::DynamicLibraries::new();
+    if count == 0 {
+        return Ok(out);
+    }
+    if libraries.is_null() {
+        return Err("null preloaded libraries".into());
+    }
+    // SAFETY: the caller's contract: `count` live handles.
+    let handles = unsafe { std::slice::from_raw_parts(libraries, usize::try_from(count).map_err(e("preloaded library count"))?) };
+    for &library in handles {
+        out = out.with_preloaded(get(library)?.0.preloaded_library());
+    }
+    Ok(out)
 }
 
 /// The linked functions of a counted array of live function handles.
@@ -1533,7 +1605,7 @@ fn compute_descriptor(descriptor: *const NmbComputePipelineDescriptor) -> Result
     let mut linked = LinkedFunctions::new();
     linked.functions = linked_list(d.linked, d.linked_count)?;
     linked.private_functions = linked_list(d.private_linked, d.private_linked_count)?;
-    let kernel = get(d.function)?.0.function_descriptor().with_linked(linked);
+    let kernel = get(d.function)?.0.function_descriptor().with_linked(linked).with_libraries(preloaded_list(d.preloaded, d.preloaded_count)?);
     let mut out = ComputePipelineDescriptor::new(StageSource::Function(kernel));
     out.max_total_threads_per_threadgroup = if d.max_threads == 0 { None } else { Some(u32::try_from(d.max_threads).map_err(e("compute max threads"))?) };
     out.threadgroup_size_is_multiple_of_execution_width = d.multiple_of_execution_width != 0;
@@ -1624,6 +1696,10 @@ pub struct NmbRenderPipelineDescriptor {
     pub fragment_linked_count: u64,
     pub fragment_private_linked: *const *mut NmbFunction,
     pub fragment_private_linked_count: u64,
+    pub vertex_preloaded: *const *mut NmbDynamicLibrary,
+    pub vertex_preloaded_count: u64,
+    pub fragment_preloaded: *const *mut NmbDynamicLibrary,
+    pub fragment_preloaded_count: u64,
 }
 
 /// A post-tessellation vertex function's state; `tessellates` 0 leaves the descriptor's tessellation unset.
@@ -1698,11 +1774,13 @@ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<R
             Ok(linked)
         };
         let vertex = get(d.vertex)?.0.function_descriptor()
-            .with_linked(stage_linked(d.vertex_linked, d.vertex_linked_count, d.vertex_private_linked, d.vertex_private_linked_count)?);
+            .with_linked(stage_linked(d.vertex_linked, d.vertex_linked_count, d.vertex_private_linked, d.vertex_private_linked_count)?)
+            .with_libraries(preloaded_list(d.vertex_preloaded, d.vertex_preloaded_count)?);
         let mut out = RenderPipelineDescriptor::new(StageSource::Function(vertex));
         if !d.fragment.is_null() {
             let fragment = get(d.fragment)?.0.function_descriptor().with_linked(stage_linked(
-                d.fragment_linked, d.fragment_linked_count, d.fragment_private_linked, d.fragment_private_linked_count)?);
+                d.fragment_linked, d.fragment_linked_count, d.fragment_private_linked, d.fragment_private_linked_count)?)
+                .with_libraries(preloaded_list(d.fragment_preloaded, d.fragment_preloaded_count)?);
             out.fragment = Some(StageSource::Function(fragment));
         }
         for (slot, c) in out.color_attachments.iter_mut().zip(d.colors.iter()) {

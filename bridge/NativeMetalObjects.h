@@ -16,6 +16,7 @@ typedef struct NmbBuffer NmbBuffer;
 typedef struct NmbHeap NmbHeap;
 typedef struct NmbTexture NmbTexture;
 typedef struct NmbLibrary NmbLibrary;
+typedef struct NmbDynamicLibrary NmbDynamicLibrary;
 typedef struct NmbFunction NmbFunction;
 typedef struct NmbComputePipeline NmbComputePipeline;
 typedef struct NmbRenderPipeline NmbRenderPipeline;
@@ -147,6 +148,13 @@ NmbFunction *nmb_function_new_specialized_zero_rest(NmbLibrary *, const char *na
 void nmb_function_release(NmbFunction *);
 /* Metal's MTLFunctionType (1 vertex, 2 fragment, 3 kernel, ...). */
 uint64_t nmb_function_type(const NmbFunction *);
+/* MTLDynamicLibrary: newDynamicLibraryWithURL:error: (the dynamic library in a file, whose install name its libraries import by) and
+ * newDynamicLibrary:error: (a library of type dynamic). iPadOS 27's Core Image keeps its kernel language's standard library so
+ * (CoreImage.framework/CoreImage.metallib, every function exported). */
+NmbDynamicLibrary *nmb_dynamic_library_new_with_url(const NmbDevice *, const char *path);
+NmbDynamicLibrary *nmb_dynamic_library_new(const NmbDevice *, const NmbLibrary *);
+size_t nmb_dynamic_library_install_name(const NmbDynamicLibrary *, char *out, size_t size);
+void nmb_dynamic_library_release(NmbDynamicLibrary *);
 /* MTLFunctionDescriptor.specializedName: the function links under `name` in a pipeline's linked functions (NULL: its own name). */
 bool nmb_function_set_specialized_name(NmbFunction *, const char *name);
 uint64_t nmb_function_patch_type(const NmbFunction *);              /* MTLPatchType */
@@ -180,6 +188,9 @@ struct NmbRenderPipelineDescriptor {
     NmbFunction *const *vertex_private_linked; uint64_t vertex_private_linked_count;
     NmbFunction *const *fragment_linked; uint64_t fragment_linked_count;
     NmbFunction *const *fragment_private_linked; uint64_t fragment_private_linked_count;
+    /* vertexPreloadedLibraries / fragmentPreloadedLibraries: each stage's dynamic libraries, searched first, in order. */
+    NmbDynamicLibrary *const *vertex_preloaded; uint64_t vertex_preloaded_count;
+    NmbDynamicLibrary *const *fragment_preloaded; uint64_t fragment_preloaded_count;
 };
 NmbRenderPipeline *nmb_render_pipeline_new(NmbDevice *, const struct NmbRenderPipelineDescriptor *);
 /* Descriptor binaryArchives and MTLPipelineOption bits. NULL options means defaults.
@@ -192,6 +203,8 @@ struct NmbComputePipelineDescriptor {
     /* linkedFunctions.functions and .privateFunctions: visible functions the kernel calls. */
     NmbFunction *const *linked; uint64_t linked_count;
     NmbFunction *const *private_linked; uint64_t private_linked_count;
+    /* preloadedLibraries: the kernel's dynamic libraries, searched first, in order. */
+    NmbDynamicLibrary *const *preloaded; uint64_t preloaded_count;
 };
 NmbComputePipeline *nmb_compute_pipeline_new_with_options(NmbDevice *, NmbFunction *, const struct NmbPipelineOptions *);
 NmbComputePipeline *nmb_compute_pipeline_new_with_descriptor(NmbDevice *, const struct NmbComputePipelineDescriptor *, const struct NmbPipelineOptions *);

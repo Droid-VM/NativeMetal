@@ -1213,6 +1213,20 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 @property(nonatomic,strong) NSData *bitCodeHashData;
 @property(nonatomic,strong) MTLFunctionConstantValues *constantValues;   // specialized with (nil: none), for the zero-rest rebuild of a refused pipeline
 @end
+// MTLDynamicLibrary: iPadOS 27's Core Image keeps its kernel language's standard library as one (CoreImage.framework/CoreImage.metallib,
+// every function exported) and its kernels import from it by install name; the runtime loads it (newDynamicLibraryWithURL:error:) and a
+// pipeline stage searches it (preloadedLibraries), or loads it by the install name its library imports from when the pipeline is made.
+@interface NBDynamicLibrary : NBObject
+@property(nonatomic) NmbDynamicLibrary *handle;
+@end
+@implementation NBDynamicLibrary
+- (void)dealloc {if(_handle)nmb_dynamic_library_release(_handle);}
+- (NSString *)installName {
+ const size_t n=nmb_dynamic_library_install_name(_handle,nullptr,0);std::string name(n+1,'\0');
+ nmb_dynamic_library_install_name(_handle,name.data(),name.size());name.resize(n);return @(name.c_str());
+}
+- (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error {if(error)*error=nbError(@"serializing a dynamic library is not implemented");return NO;}
+@end
 @implementation NBFunction
 - (void)dealloc {if(_handle)nmb_function_release(_handle);}
 // _MTLFunction's bitCodeHash (32 bytes), read by the stitched-library path (createStitchingScriptHash): a digest naming this function
@@ -3159,7 +3173,12 @@ static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,
 }
 // A render pipeline descriptor in the bridge's form; false, with the error, for a function of another device.
 // A render descriptor with the storage its linked-function arrays point into (it outlives every call that reads the descriptor).
-struct NBRenderDescriptor : NmbRenderPipelineDescriptor {std::vector<NmbFunction *> linked[4];};
+struct NBRenderDescriptor : NmbRenderPipelineDescriptor {std::vector<NmbFunction *> linked[4];std::vector<NmbDynamicLibrary *> preloaded[2];};
+// A stage's preloaded dynamic libraries as handles; false for one of another device.
+static bool preloadedHandles(NSArray<id<MTLDynamicLibrary>> *libraries,std::vector<NmbDynamicLibrary *> &out) {
+ for(id<MTLDynamicLibrary> l in libraries){if(![(id)l isKindOfClass:[NBDynamicLibrary class]] || ![(NBDynamicLibrary *)l handle])return false;out.push_back([(NBDynamicLibrary *)l handle]);}
+ return true;
+}
 static bool linkedHandles(NSArray<id<MTLFunction>> *functions,std::vector<NmbFunction *> &out);
 static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NBRenderDescriptor *p,NSError **error) {
  if(![(id)d.vertexFunction isKindOfClass:[NBFunction class]] || (d.fragmentFunction && ![(id)d.fragmentFunction isKindOfClass:[NBFunction class]])) {
@@ -3186,6 +3205,11 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NBRenderDescriptor *
  p->vertex_private_linked=p->linked[1].data();p->vertex_private_linked_count=p->linked[1].size();
  p->fragment_linked=p->linked[2].data();p->fragment_linked_count=p->linked[2].size();
  p->fragment_private_linked=p->linked[3].data();p->fragment_private_linked_count=p->linked[3].size();
+ if(!preloadedHandles(d.vertexPreloadedLibraries,p->preloaded[0]) || !preloadedHandles(d.fragmentPreloadedLibraries,p->preloaded[1])) {
+  if(error)*error=nbError(@"foreign preloaded library");return false;
+ }
+ p->vertex_preloaded=p->preloaded[0].data();p->vertex_preloaded_count=p->preloaded[0].size();
+ p->fragment_preloaded=p->preloaded[1].data();p->fragment_preloaded_count=p->preloaded[1].size();
  for(unsigned i=0;i<8;i++) {
   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];
   p->colors[i]={(uint64_t)a.pixelFormat,(uint64_t)a.writeMask,(uint64_t)a.blendingEnabled,(uint64_t)a.sourceRGBBlendFactor,(uint64_t)a.destinationRGBBlendFactor,
@@ -3627,7 +3651,7 @@ static NBFunction *zeroRestFunction(NBFunction *f) {
 }
 // The handles `p` points at live in `linked` and `privateLinked`, which outlive its use.
 static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipelineDescriptor *p,std::vector<NmbFunction *> &linkedStore,
-                              std::vector<NmbFunction *> &privateStore,NSError **error) {
+                              std::vector<NmbFunction *> &privateStore,NSError **error,std::vector<NmbDynamicLibrary *> *preloadedStore=nullptr) {
  if(!d || ![(id)d.computeFunction isKindOfClass:[NBFunction class]] || ![(NBFunction *)d.computeFunction handle]){if(error)*error=nbError(@"foreign compute function");return false;}
  // Metal may materialize empty stage/linked descriptors on access. Preserve the
  // default meaning while refusing state this frontend cannot yet represent.
@@ -3640,8 +3664,12 @@ static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipeline
  }
  if(!empty){if(error)*error=nbError(@"compute stage inputs are not implemented");return false;}
  MTLLinkedFunctions *linked=d.linkedFunctions;
- if(linked.binaryFunctions.count || linked.groups.count || d.preloadedLibraries.count || d.insertLibraries.count) {
+ if(linked.binaryFunctions.count || linked.groups.count || (d.preloadedLibraries.count && !preloadedStore) || d.insertLibraries.count) {
   if(error)*error=nbError(@"compute binary/grouped linked functions and dynamic libraries are not implemented");return false;
+ }
+ if(preloadedStore) {
+  if(!preloadedHandles(d.preloadedLibraries,*preloadedStore)){if(error)*error=nbError(@"foreign preloaded library");return false;}
+  p->preloaded=preloadedStore->data();p->preloaded_count=preloadedStore->size();
  }
  if(!linkedHandles(linked.functions,linkedStore) || !linkedHandles(linked.privateFunctions,privateStore)) {
   if(error)*error=nbError(@"foreign linked function");return false;
@@ -3913,6 +3941,21 @@ static void journalLibrary(NmbLibrary *handle,const char *source,const void *byt
  NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=bytes;library.bytes=(const uint8_t *)bytes.bytes;library.length=bytes.length;
  if(error)*error=nil;return (id<MTLLibrary>)library;
 }
+- (BOOL)supportsDynamicLibraries {return YES;}
+- (BOOL)supportsRenderDynamicLibraries {return YES;}
+- (id<MTLDynamicLibrary>)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error {
+ if(!url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
+ NmbDynamicLibrary *handle=nmb_dynamic_library_new_with_url(gDevice,url.path.UTF8String);
+ if(!handle){NBLOG(@"native-metal: dynamic library %@ refused: %@",url.path,lastError());if(error)*error=nbError(lastError());return nil;}
+ if(!gJournalPath.empty())journal("D src=file:"+std::string(url.path.UTF8String?:"?"));
+ NBDynamicLibrary *library=[NBDynamicLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLDynamicLibrary>)library;
+}
+- (id<MTLDynamicLibrary>)newDynamicLibrary:(id<MTLLibrary>)source error:(NSError **)error {
+ if(![(id)source isKindOfClass:[NBLibrary class]]){if(error)*error=nbError(@"foreign library");return nil;}
+ NmbDynamicLibrary *handle=nmb_dynamic_library_new(gDevice,[(NBLibrary *)source handle]);
+ if(!handle){NBLOG(@"native-metal: dynamic library refused: %@",lastError());if(error)*error=nbError(lastError());return nil;}
+ NBDynamicLibrary *library=[NBDynamicLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLDynamicLibrary>)library;
+}
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {
  if(!url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
  return [(id<MTLDevice>)self newLibraryWithFile:url.path error:error];
@@ -4037,8 +4080,8 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
                                                        reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
  if(reflection)*reflection=nil;
- NmbComputePipelineDescriptor p={};std::vector<NmbFunction *> linked,privateLinked;
- if(!computeDescriptor(d,&p,linked,privateLinked,error)){computeRefused(d.computeFunction,error && *error?(*error).localizedDescription:@"descriptor");return nil;}
+ NmbComputePipelineDescriptor p={};std::vector<NmbFunction *> linked,privateLinked;std::vector<NmbDynamicLibrary *> preloaded;
+ if(!computeDescriptor(d,&p,linked,privateLinked,error,&preloaded)){computeRefused(d.computeFunction,error && *error?(*error).localizedDescription:@"descriptor");return nil;}
  std::vector<NmbBinaryArchive *> archives;
  if(!pipelineArchives(d.binaryArchives,archives,error))return nil;
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};

@@ -11,6 +11,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include <os/log.h>
 #include <algorithm>
 #include <array>
 #include <memory>
@@ -407,7 +408,9 @@ static void noteProblem(NSString *what) {
 extern "C" void native_bridge_metal_note(const char *what) {noteProblem([NSString stringWithUTF8String:what]?:@"?");}
 // NMB_LOG_STDERR: also on stderr (a daemon's NSLog reaches only the unified log, which a bring-up board does not read).
 static bool logToStderr() {static bool on=getenv("NMB_LOG_STDERR")!=nullptr;return on;}
-#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);\
+// Public in the unified log: NSLog(@"%@") stored every line as <private>, so a refusal's reason was unreadable in a log archive.
+#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];os_log(OS_LOG_DEFAULT,"%{public}s",nbText.UTF8String?:"?");\
+ noteProblem(nbText);\
  if(logToStderr())fprintf(stderr,"%s: %.140s\n",getprogname(),nbText.UTF8String?:"?");}while(0)
 // The render server does not get past the loss of its GPU context: CoreAnimation keeps submitting to the dead context and
 // the display shows the surfaces it composed last until backboardd restarts (the hang's evidence is in the host's KGSL log
@@ -4188,6 +4191,7 @@ static void installAnswers(Class cls) {
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
+ nmb_set_panic_note([](const char *what){NBLOG(@"native-metal: %s",what);});
  gDevice=nmb_device_open(loader,cache);
  if(loader)gLoaderPath=loader;
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}

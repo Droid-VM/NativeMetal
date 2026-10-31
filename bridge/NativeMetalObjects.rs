@@ -165,6 +165,33 @@ impl NmbDevice {
     }
 }
 
+static PANIC_NOTE: std::sync::atomic::AtomicPtr<c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Sends each panic's message, place and thread to `note` before the panic unwinds, then runs the hook installed before. The
+/// runtime's own threads (metal2vulkan-handlers) catch no panic, and on arm64e libunwind failed a pointer authentication while
+/// unwinding one (KaleidoscopePoster, EXC_ARM_PAC_FAIL in UnwindCursor::setReg): the process died with the panic's text unseen.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_set_panic_note(note: Option<extern "C" fn(*const c_char)>) {
+    PANIC_NOTE.store(note.map_or(std::ptr::null_mut(), |f| f as *mut c_void), std::sync::atomic::Ordering::Release);
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let earlier = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let note = PANIC_NOTE.load(std::sync::atomic::Ordering::Acquire);
+            if !note.is_null() {
+                let thread = std::thread::current();
+                let text = format!("rust panic on {}: {info}", thread.name().unwrap_or("?")).replace('\0', " ");
+                if let Ok(text) = std::ffi::CString::new(text) {
+                    // SAFETY: `note` was stored from an `extern "C" fn(*const c_char)`.
+                    let note: extern "C" fn(*const c_char) = unsafe { std::mem::transmute(note) };
+                    note(text.as_ptr());
+                }
+            }
+            earlier(info);
+        }));
+    });
+}
+
 /// # Safety
 /// `loader` and `cache` are C strings.
 #[unsafe(no_mangle)]

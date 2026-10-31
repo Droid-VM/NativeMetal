@@ -34,6 +34,8 @@ const void *nmb_fixture_air(size_t *length);
 const void *nmb_scanout_convert_air(size_t *length);
 const void *nmb_function_constant_air(size_t *length);
 
+/* Where a Rust panic's message and place go, before it unwinds (any thread, once per panic): the runtime's own threads catch none. */
+void nmb_set_panic_note(void (*note)(const char *what));
 /* loader: a library exporting vkGetInstanceProcAddr (Turnip on the tablet). cache: a writable directory for translated shaders. */
 NmbDevice *nmb_device_open(const char *loader, const char *cache);
 void nmb_device_release(NmbDevice *);

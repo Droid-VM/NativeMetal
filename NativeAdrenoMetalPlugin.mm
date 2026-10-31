@@ -284,6 +284,15 @@ static id deviceForPort(unsigned port) {
             if (confstr(_CS_DARWIN_USER_TEMP_DIR, log, sizeof log - 16)) {strlcat(log, "mesa.log", sizeof log); setenv("MESA_LOG_FILE", log, 1);}
             setenv("MESA_VK_ABORT_ON_DEVICE_LOSS", "1", 1);
         }
+        // Diagnostic: while /private/var/ngpu/debug/gpu-traces exists when the process opens its device, Turnip's u_trace writes the
+        // GPU's own timestamps around each render pass and its stages (binning, each tile's loads and stores, sysmem clears, blits)
+        // to gpu-traces.log in the process's temporary directory (MESA_GPU_TRACES=print): where a frame's GPU time goes, measured
+        // rather than inferred (a 2048x2732 frame took 5-6 ms of GPU time whatever the GPU clock).
+        if (access("/private/var/ngpu/debug/gpu-traces", F_OK) == 0) {
+            char path[512];
+            if (confstr(_CS_DARWIN_USER_TEMP_DIR, path, sizeof path - 16)) {strlcat(path, "gpu-traces.log", sizeof path); setenv("MESA_GPU_TRACEFILE", path, 1);}
+            setenv("MESA_GPU_TRACES", "print", 1);
+        }
         // A/B: while /private/var/ngpu/debug/no-inline-memoryless exists when the process opens its device, a render pass with a
         // memoryless color records its first instance in a secondary (fork patches/metal2vulkan/0014, METAL2VULKAN_INLINE_MEMORYLESS=0),
         // so a later draw that writes the color no longer splits the pass: Core Animation's 2048x2732 frame passes split so at almost

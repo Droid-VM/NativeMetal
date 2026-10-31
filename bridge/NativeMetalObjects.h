@@ -147,6 +147,8 @@ NmbFunction *nmb_function_new_specialized_zero_rest(NmbLibrary *, const char *na
 void nmb_function_release(NmbFunction *);
 /* Metal's MTLFunctionType (1 vertex, 2 fragment, 3 kernel, ...). */
 uint64_t nmb_function_type(const NmbFunction *);
+/* MTLFunctionDescriptor.specializedName: the function links under `name` in a pipeline's linked functions (NULL: its own name). */
+bool nmb_function_set_specialized_name(NmbFunction *, const char *name);
 uint64_t nmb_function_patch_type(const NmbFunction *);              /* MTLPatchType */
 int64_t nmb_function_patch_control_point_count(const NmbFunction *); /* -1: no patch, or no count stated */
 

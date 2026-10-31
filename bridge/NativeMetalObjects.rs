@@ -1442,6 +1442,22 @@ pub extern "C" fn nmb_function_release(function: *mut NmbFunction) {
     release(function)
 }
 
+/// `MTLFunctionDescriptor.specializedName`: the function links under `name` (null: its own name). iPadOS 27's RenderBox makes
+/// IconRendering's `clampedPlusL_v1` as `custom_blend`, the name its fragment functions call; linked under its own name the
+/// runtime refused the pipeline (NeedsInput LinkedFunction custom_blend) and iconservicesagent crashed in Core Image.
+///
+/// # Safety
+/// `name` is null or a C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_function_set_specialized_name(function: *mut NmbFunction, name: *const c_char) -> bool {
+    guard(false, || {
+        // SAFETY: the caller's contract.
+        let name = if name.is_null() { None } else { Some(unsafe { CStr::from_ptr(name) }.to_str().map_err(e("specialized name"))?.to_string()) };
+        get_mut(function)?.0.set_specialized_name(name);
+        Ok(true)
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_function_type(function: *const NmbFunction) -> u64 {
     guard(0, || Ok(get(function)?.0.function_type().map_err(e("function type"))?.as_raw() as u64))

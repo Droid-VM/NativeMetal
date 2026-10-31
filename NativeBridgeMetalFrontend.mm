@@ -1334,10 +1334,21 @@ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(cons
 // runtime does when the function is made.
 - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error {
  if(!d.name){if(error)*error=nbError(@"a function name is required");return nil;}
- if(d.constantValues)return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
- id<MTLFunction> function=[self newFunctionWithName:d.name];
- if(!function){if(error)*error=nbError([NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);return nil;}
+ id<MTLFunction> function=d.constantValues?[self newFunctionWithName:d.name constantValues:d.constantValues error:error]:[self newFunctionWithName:d.name];
+ if(!function){if(error && !d.constantValues)*error=nbError([NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);return nil;}
+ // The specialized name is the function's name and the name it links under: RenderBox makes IconRendering's clampedPlusL_v1 as
+ // custom_blend, which its fragment functions call (iconservicesagent's custom blends were refused and Core Image crashed).
+ NSString *specialized=d.specializedName;
+ if(specialized.length && ![specialized isEqualToString:d.name] && [(id)function isKindOfClass:[NBFunction class]] && [(NBFunction *)function handle]) {
+  nmb_function_set_specialized_name([(NBFunction *)function handle],specialized.UTF8String);
+  ((NBFunction *)function).name=specialized;
+ }
  if(error)*error=nil;return function;
+}
+// RenderBox sends the asynchronous form too: without it the selector was answered as a no-op and the handler never ran.
+- (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
+ NSError *error=nil;id<MTLFunction> function=[self newFunctionWithDescriptor:d error:&error];
+ if(handler)handler(function,error);
 }
 - (NSArray<NSString *> *)functionNames {
  NSMutableArray *names=[NSMutableArray array];

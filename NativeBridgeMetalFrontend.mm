@@ -3941,6 +3941,15 @@ static void journalLibrary(NmbLibrary *handle,const char *source,const void *byt
  NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=bytes;library.bytes=(const uint8_t *)bytes.bytes;library.length=bytes.length;
  if(error)*error=nil;return (id<MTLLibrary>)library;
 }
+// _MTLDevice's limits (private, iPadOS 27): a pointer to the device's limits struct, whose layout is not published. IconRendering reads
+// the 2D texture size limits from it at +0x84 and +0x88 (its only use, by disassembly) and refused every icon texture as too large
+// ("Attempting to create too large MTLTexture (max: 0x0)") with the selector unanswered: Settings' and Spotlight's icons were blank.
+// Those two words hold the device's 2D size limit (Adreno's 16384); every other word is zero, as the unanswered selector gave.
+- (const void *)limits {
+ static uint32_t words[1024];static dispatch_once_t once;
+ dispatch_once(&once,^{words[0x84/4]=16384;words[0x88/4]=16384;});
+ return words;
+}
 - (BOOL)supportsDynamicLibraries {return YES;}
 - (BOOL)supportsRenderDynamicLibraries {return YES;}
 - (id<MTLDynamicLibrary>)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error {

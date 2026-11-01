@@ -1101,11 +1101,16 @@ static void watchImportPressure() {
  static dispatch_once_t once;
  dispatch_once(&once,^{
   dispatch_source_t source=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,
-   DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
+   DISPATCH_MEMORYPRESSURE_NORMAL|DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
   if(!source)return;
   // The runtime's kept empty blocks (fork patch 0013) and its spare and kept blocks (bridge patch 0021) go too, as Metal's resource
-  // cache gives memory back.
+  // cache gives memory back. The source fires as the level changes, not while it stays raised, and the room the runtime keeps ahead
+  // of its placements came back with the next frame: while the level is raised the runtime keeps none (fork patch 0020), until the
+  // source reports the normal level again. Every block is wired guest memory here; the render server kept 547-616 MiB of empty ones.
   dispatch_source_set_event_handler(source,^{
+   const bool raised=(dispatch_source_get_data(source)&(DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL))!=0;
+   if(gDevice)(void)nmb_device_hold_back_memory(gDevice,raised);
+   if(!raised)return;
    trimHeldImports(true);
    if(gDevice){gTrimmedBlocks+=nmb_device_trim_memory(gDevice,0);(void)nmb_device_release_kept_memory(gDevice);}
   });

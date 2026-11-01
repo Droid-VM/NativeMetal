@@ -70,6 +70,8 @@ size_t nmb_allocation_sites(uint64_t *out, size_t max);
 bool nmb_no_copy_remaps(uint64_t out[2]);
 bool nmb_device_scheduler_counts(const NmbDevice *, uint64_t out[16]);
 uint32_t nmb_device_trim_memory(const NmbDevice *, uint32_t idle_ms);
+// While on, the runtime keeps no memory for later placements (the board's metal2vulkan 0020): on under memory pressure, off at normal.
+size_t nmb_device_hold_back_memory(const NmbDevice *, bool on);
 /* Artifact lookups and driver pipeline records are separate cache layers. */
 struct NmbShaderCacheStats {
     uint64_t hits, misses, rejected, read_failures, writes, write_failures, evictions;

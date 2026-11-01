@@ -500,6 +500,15 @@ pub extern "C" fn nmb_device_scheduler_counts(device: *const NmbDevice, out: *mu
     })
 }
 
+/// While `on`, the runtime keeps no memory for later placements -- no room ahead, no empty pooled block, no spare (the board's
+/// patches/metal2vulkan/0020): the frontend turns it on as the system reports memory pressure and off as the level is normal again,
+/// since the notification comes as the level changes and a one-time trim came back with the next frame's room. How many blocks
+/// went as it turned on.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_hold_back_memory(device: *const NmbDevice, on: bool) -> usize {
+    guard(0, || Ok(get(device)?.0.hold_back_memory(on)))
+}
+
 /// Frees the runtime's kept empty pooled blocks that have stayed empty for `idle_ms` or longer (0: all of them), answering how many
 /// went (the board's patches/metal2vulkan/0013-trim-kept-memory.patch): the frontend trims as its process idles and on memory pressure,
 /// since on a guest whose GPU imports its pages every block is wired memory the system cannot reclaim.

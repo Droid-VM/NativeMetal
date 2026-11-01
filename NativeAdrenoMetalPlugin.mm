@@ -9,6 +9,7 @@
 // own GPU plugin.
 #import <Foundation/Foundation.h>
 #include <pthread.h>
+#include <thread>
 #include <dlfcn.h>
 #if __has_feature(ptrauth_calls)
 #include <ptrauth.h>
@@ -18,6 +19,7 @@
 #include <fts.h>
 #include <mach/mach.h>
 #include <sys/sysctl.h>
+#include <libkern/OSCacheControl.h>
 #include <objc/message.h>
 #include "NativeAdrenoUserTest.h"
 #include "NativeMetalBridgePhase.h"
@@ -105,6 +107,32 @@ static bool writeTask(uintptr_t address, const void *data, size_t size) {
 }
 // EXPERIMENT (second report onward): this display path takes plain 8-bit BGRA only, so tell the render server's display that it has neither the deep
 // (10-bit) framebuffer nor universal buffer compression. Whether the state it reads those from is the whole story is what the markers show.
+// EXPERIMENT (boot-arg sheng-fb-bgra=1): the render server's framebuffer format with every other virtualized answer left as it is.
+// framebuffer_pixel_format (24A446 0x184461838) takes RGhA on `tbnz w8, #0` at 0x184461928 when CADeviceIsVirtualized (byte 0x1e701bdd9) is 1;
+// 40 other places in QuartzCore read the same byte (XR formats, backdrop compute, ASTC ...). Holding the byte at 0 turned all of them, and the
+// tablet drew light blue blocks. Here the byte stays 1 and only this branch is made a NOP, so the framebuffer is chosen as on a real device and
+// nothing else changes. Marks 0x6E40 unreadable, 0x6E41 other instruction, 0x6E42 patched, 0x6E50|stage failures.
+static bool bootArgSet(const char *key) {
+    char args[1100] = {};
+    size_t size = sizeof args - 1;
+    return sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0 && strstr(args, key);
+}
+static unsigned patchFramebufferBranch(uintptr_t slide) {
+    const uintptr_t site = 0x184461928 + slide;
+    uint32_t word = 0;
+    if (!readTask(site, &word, sizeof word)) return 0x6E40;
+    if (word == 0xd503201f) return 0x6E42;
+    if (word != 0x37000608) return 0x6E41;
+    const vm_address_t page = site & ~(uintptr_t)(vm_page_size - 1);
+    if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) return 0x6E51;
+    const uint32_t nop = 0xd503201f;
+    const bool wrote = vm_write(mach_task_self(), site, (vm_offset_t)&nop, sizeof nop) == KERN_SUCCESS;
+    const bool restored = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE) == KERN_SUCCESS;
+    sys_icache_invalidate((void *)site, sizeof nop);
+    if (!wrote) return 0x6E52;
+    if (!restored) return 0x6E53;
+    return 0x6E42;
+}
 static unsigned gReports;
 struct DisplaySample {unsigned flags = 0, mode = 0, behaviour = 0, globals = 0; uint16_t display = 0; uintptr_t object = 0;};
 static DisplaySample sampleDisplay(id first, intptr_t slide) {
@@ -200,11 +228,33 @@ static void clientFailure(unsigned port, const char *step, const char *detail) {
         // follows in rows of its own, up to six, each 46 characters.
         if (!strcmp(step, "problem") && length > 46)
             for (unsigned part = 1, at = 46; part <= 6 && at < length; ++part, at += 46) {
-                char row[64];
-                snprintf(row, sizeof row, "problem%u %.46s", part, detail + at);
-                streamText(*gpu, row);
+                // The log keeps the latest text row only: each part follows the one before it by 4 s so a sample catches every one.
+                std::string row = "problem" + std::to_string(part) + " " + std::string(detail + at).substr(0, 46);
+                auto *target = gpu;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, int64_t(part) * 4 * NSEC_PER_SEC),
+                               dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{streamText(*target, row.c_str());});
             }
     }
+}
+// Each process's own render passes, as its Turnip recorded them (NativeBridgeMetalFrontend.mm): the slowest one's size, format and draw
+// count and the pass total, on the client's text line every 10 s while the diagnostics are on. A client whose jobs each took 77 ms showed
+// only that; which pass and at what size is what says whether the cost is the driver's.
+extern "C" size_t nmb_slowest_pass(char *out, size_t size) __attribute__((weak));
+static void startPassReporter(unsigned port) {
+    if (!getenv("SHENG_DIAG") || !&nmb_slowest_pass) return;
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    Gpu *gpu = makeGpu(port);
+    if (!gpu) return;
+    std::thread([gpu]{
+        pthread_setname_np("pass-reporter");
+        for (;;) {
+            sleep(5);
+            char row[200];
+            if (!nmb_slowest_pass(row, sizeof row) || !row[0]) continue;
+            streamText(*gpu, row);
+        }
+    }).detach();
 }
 static id clientDevice(unsigned port) {
     char turnip[1024];
@@ -253,6 +303,7 @@ static id clientDevice(unsigned port) {
     // once-a-second reader never ran before the crash (i568).
     if (device) {
         gClientPort = port;
+        startPassReporter(port);
         native_bridge_metal_problem_hook = [](const char *problem) {clientFailure(gClientPort, "problem", problem);};
         char problem[200] = {};
         if (native_bridge_metal_first_problem(problem, sizeof problem) && problem[0]) clientFailure(port, "problem", problem);
@@ -275,7 +326,30 @@ static id deviceForPort(unsigned port) {
             if (fgets(line, sizeof line, flags)) {line[strcspn(line, "\n")] = 0; setenv("TU_DEBUG", line, 1);}
             fclose(flags);
         }
-        setenv("TU_DEBUG", "nocb", 0);
+        // sheng-tu-debug=<flags>: TU_DEBUG for every Metal process (an experiment: sysmem renders without GMEM load and store, gmem always with them).
+        {
+            char args[1100] = {};
+            size_t size = sizeof args - 1;
+            if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
+                if (const char *at = strstr(args, "sheng-tu-debug=")) {
+                    char value[64] = {};
+                    strlcpy(value, at + 15, sizeof value);
+                    value[strcspn(value, " ")] = 0;
+                    setenv("TU_DEBUG", value, 1);
+                }
+        }
+        // Every pass renders in system memory with the 8-bit BGRA framebuffer (sheng-fb-bgra=1): measured against tile memory with the swap of
+        // GMEM loads and stores fixed (patches/mesa/turnip-gmem-mutable-swap.patch, lock screen 99.5 % equal to the RGhA picture), the GPU time per
+        // command buffer was no better (17.8 ms mean and 56.1 ms at p95 in tile memory, 17.1 and 52.1 in system memory), and one home screen frame
+        // still came out with red and blue exchanged. sheng-tu-debug= overrides this for experiments.
+        setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
+        // sheng-diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
+        // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
+        if (bootArgSet("sheng-diag=1")) setenv("SHENG_DIAG", "1", 1);
+        else unsetenv("SHENG_DIAG");
+        // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
+        if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
+        else unsetenv("SHENG_LOG_GPU");
         // Diagnostic: while /private/var/ngpu/debug/mesa-log exists when the process opens its device, Mesa's log -- Turnip's reason
         // for a lost device among it -- goes to mesa.log in the process's temporary directory instead of the stderr no reader of a
         // daemon's sees, and a lost device aborts the process where Turnip declares it, so the crash report names the place.
@@ -371,11 +445,14 @@ static id deviceForPort(unsigned port) {
             const int64_t onceDone = -1;
             gpu->mark(writeTask(0x1e701bdd9 + slide, &off, sizeof off) && writeTask(0x1e7020780 + slide, &onceDone, sizeof onceDone) &&
                       writeTask(0x1e701bdd9 + slide, &off, sizeof off) ? 0x6E04 : 0x6EF4);
+            if (!strcmp(getprogname(), "backboardd") && bootArgSet("sheng-fb-bgra=1")) gpu->mark(patchFramebufferBranch(slide));
             // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
             // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
             // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156), 0x10 the device-is-virtualized byte (0x1e701bdd9).
-            // i35abaf83 read 0x6E23 and the framebuffer stayed RGhA (48388K swap surfaces, 8 bytes a pixel): the virtualized byte,
-            // set from the MobileGestalt key in the constant CFString at 0x1e9021680, noted as "ca virtualized key ..." (above).
+            // i35abaf83 read 0x6E23 and the framebuffer stayed RGhA (48388K swap surfaces, 8 bytes a pixel). The function has two more
+            // ways to RGhA: the display's own flag (+0x6840 of the display) and, when no compression format was picked, the virtualized
+            // byte, which sub_184541f10 stores once from a call with the constant CFString at 0x1e9021680; the string's text is noted
+            // ("ca virtualized key ...") so the answer behind it can be found.
             static uintptr_t gSlide;
             gSlide = slide;
             pthread_t reader;
@@ -407,8 +484,9 @@ static id deviceForPort(unsigned port) {
         // runtime for it here (patches/metal2vulkan/0012): where the host offers priorities, its frames no longer wait on the GPU behind
         // an app's.
         setenv("METAL2VULKAN_QUEUE_PRIORITY", "high", 0);
-        // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums.
-        setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
+        // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums
+        // (sheng-diag=1).
+        if (getenv("SHENG_DIAG")) setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         char candidates[5][512] = {};
@@ -457,13 +535,15 @@ static id deviceForPort(unsigned port) {
             return nil;
         }
         gpu->mark(0x6802);
-        // The status line (GPU8) every ten seconds, and the display hand-off client on its own thread: both only read or serve, neither is the discovery's.
+        // The status line (GPU8) every ten seconds (sheng-diag=1), and the display hand-off client on its own thread: both only read or serve,
+        // neither is the discovery's.
         pthread_t monitor, scanout;
         pthread_attr_t attributes;
         pthread_attr_init(&attributes);
         pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
         pthread_attr_setstacksize(&attributes, 1u << 20);
-        pthread_create(&monitor, &attributes, [](void *arg) -> void * {
+        const bool diag = getenv("SHENG_DIAG") != nullptr;
+        if (diag) pthread_create(&monitor, &attributes, [](void *arg) -> void * {
             Gpu *g = static_cast<Gpu *>(arg);
             for (;;) {
                 sleep(10);
@@ -489,7 +569,7 @@ static id deviceForPort(unsigned port) {
             return nullptr;
         }, gpu);
         pthread_t telemetry;
-        pthread_create(&telemetry, &attributes, [](void *arg) -> void * {
+        if (diag) pthread_create(&telemetry, &attributes, [](void *arg) -> void * {
             Gpu *g = static_cast<Gpu *>(arg);
             sleep(5);
             // The bridge's telemetry table, resent whole every four seconds as markers (two characters each): 0xC000|row starts a row of the

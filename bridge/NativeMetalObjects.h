@@ -44,6 +44,10 @@ size_t nmb_device_name(const NmbDevice *, char *out, size_t size);
 uint64_t nmb_device_max_buffer_length(const NmbDevice *);
 // Pipeline makings (count, total us, longest us, waited us, failed), sink messages (info, warning+), shader cache hits/misses/writes.
 bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
+/* The shader cache's full counts in 24 words: hits, misses, function hits and misses, compute pipeline hits and misses, render pipeline hits and misses,
+ * rejected, read failures, writes, writes queued, writes on a calling thread, bytes written, queued hits, write failures, evictions, driver cache loads,
+ * driver pipeline hits, driver pipeline misses, driver saves, then three spare zeros. */
+bool nmb_device_shader_cache_detail(const NmbDevice *, uint64_t out[24]);
 /* The translator source the runtime was built from, which keys the shader cache (build-native-metal-bridge.py). */
 const char *nmb_runtime_build(void);
 // Linear images made/refused/refused again, shadowed textures, shadow copies, texels copied back, linear passes in place/through copies.
@@ -54,13 +58,18 @@ bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
 // Bytes of pooled blocks live and placed in them, empty kept, dedicated, host imports; bytes allocated so far; pooled and dedicated
 // blocks live; GPU pool blocks made and released.
 bool nmb_device_memory_counts(const NmbDevice *, uint64_t out[10]);
-bool nmb_device_scheduler_counts(const NmbDevice *, uint64_t out[16]);
-uint32_t nmb_device_trim_memory(const NmbDevice *, uint32_t idle_ms);
+/* The runtime's command buffer stages from sequence from on (bridge patch 0022): 24-byte records {u64 uptime ns, u64 id, u32 sequence,
+ * u16 stage, u16 arg}; returns how many, *next the sequence to ask for next. */
+size_t nmb_stage_ring_read(uint64_t from, void *out, size_t max, uint64_t *next);
+/* Frees the runtime's spare dedicated blocks and kept empty pooled blocks (memory pressure); returns how many went. */
+size_t nmb_device_release_kept_memory(const NmbDevice *);
 // Call stacks that allocated device memory of 4 MiB or more, most bytes first: records of twelve words (bytes, allocations, ten return
 // addresses); returns how many were written, at most max.
 size_t nmb_allocation_sites(uint64_t *out, size_t max);
 // No-copy ranges checked, and those whose pages had changed since a buffer was last made over them (reported to the runtime as remapped).
 bool nmb_no_copy_remaps(uint64_t out[2]);
+bool nmb_device_scheduler_counts(const NmbDevice *, uint64_t out[16]);
+uint32_t nmb_device_trim_memory(const NmbDevice *, uint32_t idle_ms);
 /* Artifact lookups and driver pipeline records are separate cache layers. */
 struct NmbShaderCacheStats {
     uint64_t hits, misses, rejected, read_failures, writes, write_failures, evictions;

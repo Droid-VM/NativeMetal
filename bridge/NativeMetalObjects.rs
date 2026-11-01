@@ -337,6 +337,46 @@ pub extern "C" fn nmb_device_work_stats(device: *const NmbDevice, out: *mut u64)
     })
 }
 
+/// The device's shader cache counts into the caller's 24 words (`nmb_device_shader_cache_detail` in the header): everything
+/// `ShaderCacheStatistics` holds that tells whether the cache worked and why not.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_shader_cache_detail(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null stats".into());
+        }
+        // SAFETY: the header's 24 words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 24) };
+        let c = get(device)?.0.shader_cache_statistics();
+        let words = [
+            c.hits,
+            c.misses,
+            c.function_hits,
+            c.function_misses,
+            c.compute_pipeline_hits,
+            c.compute_pipeline_misses,
+            c.render_pipeline_hits,
+            c.render_pipeline_misses,
+            c.rejected,
+            c.read_failures,
+            c.writes,
+            c.writes_queued,
+            c.writes_on_thread,
+            c.written_bytes,
+            c.queued_hits,
+            c.write_failures,
+            c.evictions,
+            c.driver_loads,
+            c.driver_pipeline_hits,
+            c.driver_pipeline_misses,
+            c.driver_saves,
+        ];
+        out.fill(0);
+        out[..words.len()].copy_from_slice(&words);
+        Ok(true)
+    })
+}
+
 /// The device's texture copy counts into the caller's eight words: textures over host pages in place, of them linear images at Metal's
 /// row pitch, host-page textures shadowed for their pitch and for no image the driver makes, textures given a shadow image, shadow
 /// copies in and texels copied back, and host-page textures shadowed as render targets.
@@ -394,6 +434,49 @@ pub extern "C" fn nmb_device_memory_counts(device: *const NmbDevice, out: *mut u
     })
 }
 
+/// The runtime's command buffer stages (bridge patch 0022, `stage_trace.rs`) from sequence `from` on, at most `max` records of
+/// {u64 host uptime ns, u64 id, u32 sequence, u16 stage, u16 arg}: how many were written; `*next` the sequence to ask for next.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_stage_ring_read(from: u64, out: *mut metal2vulkan_runtime::stage_trace::StageRecord, max: usize,
+                                      next: *mut u64) -> usize {
+    if out.is_null() || next.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller's `max` records and its word.
+    let records = unsafe { std::slice::from_raw_parts_mut(out, max) };
+    let (count, following) = metal2vulkan_runtime::stage_trace::read(from, records);
+    unsafe { *next = following };
+    count
+}
+
+/// Free the runtime's spare dedicated blocks and kept empty pooled blocks (bridge patch 0021), as Metal gives its resource cache's
+/// memory back when the system reports memory pressure: how many blocks went.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_release_kept_memory(device: *const NmbDevice) -> usize {
+    guard(0, || Ok(get(device)?.0.release_kept_memory()))
+}
+
+/// The call stacks that allocated device memory of 4 MiB or more (bridge patch 0020), most bytes first, into the caller's `max` records
+/// of twelve words: bytes, allocations, then ten return addresses (0 past the stack's end). Returns the records written.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_allocation_sites(out: *mut u64, max: usize) -> usize {
+    if out.is_null() {
+        return 0;
+    }
+    let sites = metal2vulkan_runtime::allocation_sites();
+    let count = sites.len().min(max);
+    // SAFETY: the caller's `max` records of twelve words.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, count * 12) };
+    for (record, site) in out.chunks_mut(12).zip(&sites) {
+        record[0] = site.bytes;
+        record[1] = site.count;
+        for (word, frame) in record[2..].iter_mut().zip(site.frames) {
+            *word = frame as u64;
+        }
+    }
+    count
+}
+
 /// What held the scheduler's batches back from the GPU, into the caller's sixteen words: heads found held for their host step, of them
 /// left waiting at their gate (every `VkQueue` to complete what was submitted before), heads held for an event value and behind an
 /// earlier commit; batches held past a look and the nanoseconds they were held; grouped submissions, the batches in them, groups kept
@@ -423,27 +506,6 @@ pub extern "C" fn nmb_device_scheduler_counts(device: *const NmbDevice, out: *mu
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_device_trim_memory(device: *const NmbDevice, idle_ms: u32) -> u32 {
     guard(0, || Ok(get(device)?.0.trim_kept_memory(std::time::Duration::from_millis(u64::from(idle_ms))) as u32))
-}
-
-/// The call stacks that allocated device memory of 4 MiB or more (bridge patch 0020), most bytes first, into the caller's `max` records
-/// of twelve words: bytes, allocations, then ten return addresses (0 past the stack's end). Returns the records written.
-#[unsafe(no_mangle)]
-pub extern "C" fn nmb_allocation_sites(out: *mut u64, max: usize) -> usize {
-    if out.is_null() {
-        return 0;
-    }
-    let sites = metal2vulkan_runtime::allocation_sites();
-    let count = sites.len().min(max);
-    // SAFETY: the caller's `max` records of twelve words.
-    let out = unsafe { std::slice::from_raw_parts_mut(out, count * 12) };
-    for (record, site) in out.chunks_mut(12).zip(&sites) {
-        record[0] = site.bytes;
-        record[1] = site.count;
-        for (word, frame) in record[2..].iter_mut().zip(site.frames) {
-            *word = frame as u64;
-        }
-    }
-    count
 }
 
 /// Separate artifact and driver-record counters, mirroring the C ABI.

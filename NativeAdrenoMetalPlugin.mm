@@ -256,6 +256,12 @@ static void startPassReporter(unsigned port) {
         }
     }).detach();
 }
+// The runtime's pooled blocks of 16 MiB, not 64 (the board's patches/metal2vulkan/0019): here every block is wired guest memory, and
+// each pool grows, keeps room and keeps an empty block a whole block at a time. The render server held 547-616 MiB of empty blocks at
+// the home screen, and opening an app grew its pooled blocks by 640 MiB for 187 MiB placed in them.
+static void boundPooledBlocks() {
+    setenv("METAL2VULKAN_BLOCK_MIB", "16", 0);
+}
 static id clientDevice(unsigned port) {
     char turnip[1024];
     if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) {clientFailure(port, "no-turnip", ""); return nil;}
@@ -266,6 +272,7 @@ static id clientDevice(unsigned port) {
     }
     // IOSurfaces this GPU reads or writes must be plain rows, as in the render server.
     CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+    boundPooledBlocks();
     char candidates[2][512] = {};
     if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
     if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
@@ -484,6 +491,7 @@ static id deviceForPort(unsigned port) {
         // runtime for it here (patches/metal2vulkan/0012): where the host offers priorities, its frames no longer wait on the GPU behind
         // an app's.
         setenv("METAL2VULKAN_QUEUE_PRIORITY", "high", 0);
+        boundPooledBlocks();
         // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums
         // (sheng-diag=1).
         if (getenv("SHENG_DIAG")) setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);

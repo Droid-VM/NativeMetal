@@ -4560,21 +4560,34 @@ static NSString *familyBlockers(id,SEL,NSInteger family) {
  return [NSString stringWithUTF8String:text.c_str()];
 }
 static BOOL (*gFamilyAnswer)(id,SEL,NSInteger);
-// Whether the code at a return address is RenderBox's, looked up once per address: dladdr searches the image's symbol table, and
+enum FamilyCaller {FamilyCallerOther,FamilyCallerRenderBox,FamilyCallerWebGPU};
+// The framework whose code is at a return address, looked up once per address: dladdr searches the image's symbol table, and
 // QuartzCore's pixel-format queries ask supportsFamily: for every surface it makes (a masked corner, a backdrop, a blur's mips) and every
 // IOSurface it checks -- the render server's display thread spent 15% of its running time in that search during page swipes.
-static bool callerIsRenderBox(void *address) {
+static FamilyCaller familyCaller(void *address) {
  static std::mutex lock;
- static std::unordered_map<void *,bool> known;
+ static std::unordered_map<void *,FamilyCaller> known;
  {std::lock_guard<std::mutex> hold(lock);auto found=known.find(address);if(found!=known.end())return found->second;}
  Dl_info caller;
- const bool renderBox=dladdr(address,&caller) && caller.dli_fname && strstr(caller.dli_fname,"/RenderBox.framework/");
+ FamilyCaller kind=FamilyCallerOther;
+ if(dladdr(address,&caller) && caller.dli_fname) {
+  if(strstr(caller.dli_fname,"/RenderBox.framework/"))kind=FamilyCallerRenderBox;
+  else if(strstr(caller.dli_fname,"/WebGPU.framework/"))kind=FamilyCallerWebGPU;
+ }
  std::lock_guard<std::mutex> hold(lock);
- if(known.size()<4096)known.emplace(address,renderBox);
- return renderBox;
+ if(known.size()<4096)known.emplace(address,kind);
+ return kind;
 }
+// WebKit's WebGPU (WebGPU.framework, in Safari's GPU process) makes an adapter only for a device in MTLGPUFamilyApple4 or later: Apple's
+// feature set tables list no WebGPU limits for Apple1 to Apple3, so requestAdapter() answered null and every page saw no WebGPU. The rows
+// Apple4 adds that this device refuses (gfxprobe families: imageblocks, tile shaders, raster order groups, post-depth coverage) are the
+// Apple GPUs' tile-memory features, which WebGPU has no API for, so WebGPU alone is told Apple4 (the family its tables start at).
 static BOOL familyForCaller(id self,SEL _cmd,NSInteger family) {
- if(family>=1003 && family<2000 && callerIsRenderBox(__builtin_return_address(0)))return NO;   // MTLGPUFamilyApple3 and up
+ if(family>=1003 && family<2000) {   // MTLGPUFamilyApple3 to Apple10
+  const FamilyCaller kind=familyCaller(__builtin_return_address(0));
+  if(kind==FamilyCallerRenderBox)return NO;
+  if(kind==FamilyCallerWebGPU && family==1004)return YES;   // MTLGPUFamilyApple4
+ }
  return gFamilyAnswer(self,_cmd,family);
 }
 static void installAnswers(Class cls) {

@@ -259,8 +259,14 @@ static void startPassReporter(unsigned port) {
 // The runtime's pooled blocks of 16 MiB, not 64 (the board's patches/metal2vulkan/0019): here every block is wired guest memory, and
 // each pool grows, keeps room and keeps an empty block a whole block at a time. The render server held 547-616 MiB of empty blocks at
 // the home screen, and opening an app grew its pooled blocks by 640 MiB for 187 MiB placed in them.
+// /private/var/ngpu/debug/block-mib holds another size for a test (64: the runtime's own), read where the process may read it.
 static void boundPooledBlocks() {
-    setenv("METAL2VULKAN_BLOCK_MIB", "16", 0);
+    char text[16] = {};
+    if (FILE *file = fopen("/private/var/ngpu/debug/block-mib", "r")) {
+        if (!fgets(text, sizeof text, file)) text[0] = 0;
+        fclose(file);
+    }
+    setenv("METAL2VULKAN_BLOCK_MIB", text[0] ? text : "16", 0);
 }
 static id clientDevice(unsigned port) {
     char turnip[1024];

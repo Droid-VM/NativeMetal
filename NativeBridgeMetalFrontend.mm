@@ -4209,7 +4209,14 @@ static void journalLibrary(NmbLibrary *handle,const char *source,const void *byt
  if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
- NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes)return nil;
+ NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;
+ if(!bytes) {
+  // Which library file a framework asked for and why it did not open: a framework's own message names the library at most
+  // (iPadOS 27's Core Image: "Failed to load 'ci_stdlib' Metal library.").
+  static std::atomic<int> told{0};
+  if(told.fetch_add(1)<64)NBLOG(@"native-metal: library file %@ did not open: %@",path,error&&*error?(*error).localizedDescription:@"?");
+  return nil;
+ }
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);

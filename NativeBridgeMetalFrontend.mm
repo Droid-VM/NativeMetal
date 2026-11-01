@@ -4552,6 +4552,13 @@ static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
 }
 static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}
 static BOOL flagArgAnswer(id,SEL cmd,NSUInteger arg) {return askAnswer(cmd,arg)!=0;}
+// droidvmFamilyBlockers: the rows of Apple's tables that keep a GPU family (a raw MTLGPUFamily) from being claimed on this device, each with
+// its state, one per line (nmb_device_family_blockers): what gfxprobe families prints for a family supportsFamily: answers false.
+static NSString *familyBlockers(id,SEL,NSInteger family) {
+ std::string text(nmb_device_family_blockers(gDevice,family,nullptr,0)+1,'\0');
+ nmb_device_family_blockers(gDevice,family,text.data(),text.size());
+ return [NSString stringWithUTF8String:text.c_str()];
+}
 static BOOL (*gFamilyAnswer)(id,SEL,NSInteger);
 // Whether the code at a return address is RenderBox's, looked up once per address: dladdr searches the image's symbol table, and
 // QuartzCore's pixel-format queries ask supportsFamily: for every surface it makes (a masked corner, a backdrop, a blur's mips) and every
@@ -4571,6 +4578,7 @@ static BOOL familyForCaller(id self,SEL _cmd,NSInteger family) {
  return gFamilyAnswer(self,_cmd,family);
 }
 static void installAnswers(Class cls) {
+ class_addMethod(cls,sel_registerName("droidvmFamilyBlockers:"),(IMP)familyBlockers,"@24@0:8q16");
  uint32_t kind=0;
  for(size_t i=0;const char *name=nmb_device_answer_selector(i,&kind);i++) {
   SEL sel=sel_registerName(name);uint64_t value=0;

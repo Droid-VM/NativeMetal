@@ -683,6 +683,39 @@ pub extern "C" fn nmb_device_family_waivers(device: *const NmbDevice, out: *mut 
     })
 }
 
+/// The rows that keep `family` (a raw `MTLGPUFamily`) from being claimed on this device, each with its state ("<row>: <state>"), one per
+/// line, into `out` (NUL-terminated); the length the whole text needs. The family's burn-down, which the runtime's validation lane prints on
+/// a test device, read here on the guest's own (gfxprobe families); a value that names no family says so.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_family_blockers(device: *const NmbDevice, family: i64, out: *mut c_char, size: usize) -> usize {
+    guard(0, || {
+        let d = &get(device)?.0;
+        let text = match GpuFamily::from_raw(family) {
+            None => format!("{family} names no GPU family\n"),
+            Some(family) => {
+                let mut text = String::new();
+                for r in d.family_blockers(family) {
+                    text += &format!("{}", r.row.label());
+                    if let FamilyRow::Format(_, capability) = r.row {
+                        text += &format!("/{capability:?}");
+                    }
+                    text += &format!(": {:?}\n", r.state);
+                }
+                text
+            }
+        };
+        if !out.is_null() && size > 0 {
+            let n = text.len().min(size - 1);
+            // SAFETY: `out` holds `size` bytes (the caller's contract).
+            unsafe {
+                std::ptr::copy_nonoverlapping(text.as_ptr(), out.cast::<u8>(), n);
+                *out.add(n) = 0;
+            }
+        }
+        Ok(text.len())
+    })
+}
+
 fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, String> {
     let d = &device.0;
     let p = d.properties();

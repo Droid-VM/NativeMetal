@@ -4279,9 +4279,14 @@ static void journalLibrary(NmbLibrary *handle,const char *source,const void *byt
  }
  dispatch_data_t data=dispatch_data_create(metallib.bytes,metallib.length,nullptr,^{(void)metallib;});
  id<MTLLibrary> library=[(id<MTLDevice>)self newLibraryWithData:data error:error];
- // As Metal does: a library compiled with warnings comes with them as a CompileWarning error.
- if(library && warnings.length && error)
-  *error=[NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorCompileWarning userInfo:@{NSLocalizedDescriptionKey:warnings}];
+ // A library compiled with warnings comes back without an error, its warnings in the log. The front end here runs in the metal
+ // driver's mode, which warns about more than Metal's own compile does (-Wunused-variable among them), and a client may take any
+ // error as a failure: WebKit's WebGPU refused every pipeline whose generated MSL left a parameter unused ("Failed to compile the
+ // shader source ... warning: unused variable 'parameter0'"), so the WebGPU samples' rotating cube drew nothing.
+ if(library && warnings.length) {
+  static std::atomic<int> told{0};
+  if(told.fetch_add(1)<64)NBLOG(@"native-metal: newLibraryWithSource: compiled with warnings: %@",[warnings substringToIndex:MIN(warnings.length,(NSUInteger)300)]);
+ }
  return library;
 }
 - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options completionHandler:(MTLNewLibraryCompletionHandler)handler {

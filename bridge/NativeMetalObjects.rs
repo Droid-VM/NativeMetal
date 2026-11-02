@@ -10,7 +10,8 @@ use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
 use metal2vulkan::metal::{
     BindingAccess, BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType, PixelFormat, PrimitiveTopologyClass,
     PrimitiveType, RenderStages, ResourceUsage, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
-    TessellationControlPointIndexType, TessellationFactorFormat, TessellationFactorStepFunction, TessellationPartitionMode, TextureUsage,
+    TessellationControlPointIndexType, TessellationFactorFormat, TessellationFactorStepFunction, TessellationPartitionMode, TextureSwizzle,
+    TextureSwizzleChannels, TextureUsage,
     TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
 };
 use metal2vulkan::pipeline::{
@@ -1265,6 +1266,25 @@ pub extern "C" fn nmb_texture_new_view(texture: *mut NmbTexture, format: u64, ki
             t.new_texture_view_with_levels_slices(format, raw::<TextureType>(kind, "texture type")?, ranges.0, ranges.1)
         };
         Ok(boxed(NmbTexture(view.map_err(e("texture view"))?)))
+    })
+}
+
+/// `newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:`; `swizzle` is MTLTextureSwizzleChannels' four bytes (red lowest).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_new_view_swizzle(texture: *mut NmbTexture, format: u64, kind: u64, levels: *const u64, slices: *const u64,
+                                               swizzle: u32) -> *mut NmbTexture {
+    guard(std::ptr::null_mut(), || {
+        if levels.is_null() || slices.is_null() {
+            return Err("null levels or slices".into());
+        }
+        // SAFETY: the header's two words each.
+        let (l, s) = unsafe { (std::slice::from_raw_parts(levels, 2), std::slice::from_raw_parts(slices, 2)) };
+        let ranges = (l[0]..l[0].checked_add(l[1]).ok_or("levels overflow")?, s[0]..s[0].checked_add(s[1]).ok_or("slices overflow")?);
+        let channel = |shift: u32| raw::<TextureSwizzle>(((swizzle >> shift) & 0xff) as u64, "texture swizzle");
+        let channels = TextureSwizzleChannels { red: channel(0)?, green: channel(8)?, blue: channel(16)?, alpha: channel(24)? };
+        let view = get(texture)?.0.new_texture_view_with_swizzle(raw::<PixelFormat>(format, "pixel format")?,
+                                                                 raw::<TextureType>(kind, "texture type")?, ranges.0, ranges.1, channels);
+        Ok(boxed(NmbTexture(view.map_err(e("swizzled texture view"))?)))
     })
 }
 
@@ -2939,6 +2959,17 @@ fn render<'a>(encoder: *mut NmbEncoder) -> Result<&'a mut RenderCommandEncoder, 
     }
 }
 
+/// A raw `MTLBlitOption`: the runtime takes one at a time, as Metal's validation does.
+fn blit_option(options: u64) -> Result<BlitOption, String> {
+    Ok(match options {
+        0 => BlitOption::None,
+        1 => BlitOption::DepthFromDepthStencil,
+        2 => BlitOption::StencilFromDepthStencil,
+        4 => BlitOption::RowLinearPVRTC,
+        _ => return Err(format!("blit options {options:#x} are not one Metal option")),
+    })
+}
+
 fn blit<'a>(encoder: *mut NmbEncoder) -> Result<&'a mut BlitCommandEncoder, String> {
     match get_mut(encoder)? {
         NmbEncoder::Blit(b) => Ok(b),
@@ -3186,6 +3217,25 @@ pub extern "C" fn nmb_render_draw(encoder: *mut NmbEncoder, primitive: u64, star
     })
 }
 
+/// `drawPrimitives:indirectBuffer:indirectBufferOffset:` (`indices` null) or
+/// `drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset:`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_draw_indirect(encoder: *mut NmbEncoder, primitive: u64, index_type: u64, indices: *const NmbBuffer,
+                                           index_offset: u64, indirect: *const NmbBuffer, indirect_offset: u64) -> bool {
+    guard(false, || {
+        let primitive = raw::<PrimitiveType>(primitive, "primitive")?;
+        let indirect = &get(indirect)?.0;
+        if indices.is_null() {
+            render(encoder)?.draw_primitives_indirect(primitive, indirect, indirect_offset)
+        } else {
+            render(encoder)?.draw_indexed_primitives_indirect(primitive, raw::<IndexType>(index_type, "index type")?, &get(indices)?.0,
+                                                               index_offset, indirect, indirect_offset)
+        }
+        .map_err(e("indirect draw"))?;
+        Ok(true)
+    })
+}
+
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nmb_render_draw_indexed(encoder: *mut NmbEncoder, primitive: u64, count: u32, index_type: u64, indices: *mut NmbBuffer,
@@ -3290,10 +3340,10 @@ pub extern "C" fn nmb_blit_copy_texture(encoder: *mut NmbEncoder, source: *mut N
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nmb_blit_buffer_to_texture(encoder: *mut NmbEncoder, source: *mut NmbBuffer, offset: u64, bytes_per_row: u64,
                                              bytes_per_image: u64, extent: *const u64, destination: *mut NmbTexture, slice: u64,
-                                             level: u64, destination_origin: *const u64) -> bool {
+                                             level: u64, destination_origin: *const u64, options: u64) -> bool {
     guard(false, || {
         blit(encoder)?.copy_from_buffer_to_texture(&get(source)?.0, offset, bytes_per_row, bytes_per_image, size(extent)?,
-                                                   &get(destination)?.0, slice, level, origin(destination_origin)?, BlitOption::None)
+                                                   &get(destination)?.0, slice, level, origin(destination_origin)?, blit_option(options)?)
             .map_err(e("buffer to texture"))?;
         Ok(true)
     })
@@ -3303,10 +3353,10 @@ pub extern "C" fn nmb_blit_buffer_to_texture(encoder: *mut NmbEncoder, source: *
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nmb_blit_texture_to_buffer(encoder: *mut NmbEncoder, source: *mut NmbTexture, slice: u64, level: u64,
                                              source_origin: *const u64, extent: *const u64, destination: *mut NmbBuffer, offset: u64,
-                                             bytes_per_row: u64, bytes_per_image: u64) -> bool {
+                                             bytes_per_row: u64, bytes_per_image: u64, options: u64) -> bool {
     guard(false, || {
         blit(encoder)?.copy_from_texture_to_buffer(&get(source)?.0, slice, level, origin(source_origin)?, size(extent)?,
-                                                   &get(destination)?.0, offset, bytes_per_row, bytes_per_image, BlitOption::None)
+                                                   &get(destination)?.0, offset, bytes_per_row, bytes_per_image, blit_option(options)?)
             .map_err(e("texture to buffer"))?;
         Ok(true)
     })

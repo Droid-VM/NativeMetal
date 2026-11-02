@@ -156,6 +156,9 @@ NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescr
 NmbTexture *nmb_texture_new_linear(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image);
 /* whole: a view of every level and slice as format; else levels and slices are {start, count} and kind the view's texture type. */
 NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], bool whole);
+/* swizzle: MTLTextureSwizzleChannels' four bytes, red in the lowest. */
+NmbTexture *nmb_texture_new_view_swizzle(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2],
+                                         uint32_t swizzle);
 /* setPurgeableState: with Metal's raw state; the answer's raw state, 0 where it fails. */
 uint64_t nmb_texture_set_purgeable_state(const NmbTexture *, uint64_t state);
 uint64_t nmb_buffer_set_purgeable_state(const NmbBuffer *, uint64_t state);
@@ -356,6 +359,9 @@ bool nmb_render_set_depth_bias(NmbEncoder *, float bias, float slope_scale, floa
 bool nmb_render_set_line_width(NmbEncoder *, float width);
 bool nmb_render_set_visibility_mode(NmbEncoder *, uint64_t mode, uint64_t offset);
 bool nmb_render_draw(NmbEncoder *, uint64_t primitive, uint32_t start, uint32_t count, uint32_t instances, uint32_t base_instance);
+/* NULL indices: drawPrimitives:indirectBuffer:; otherwise the indexed indirect draw. */
+bool nmb_render_draw_indirect(NmbEncoder *, uint64_t primitive, uint64_t index_type, const NmbBuffer *indices, uint64_t index_offset,
+                              const NmbBuffer *indirect, uint64_t indirect_offset);
 bool nmb_render_draw_indexed(NmbEncoder *, uint64_t primitive, uint32_t count, uint64_t index_type, NmbBuffer *indices, uint64_t offset,
                              uint32_t instances, int32_t base_vertex, uint32_t base_instance);
 /* NULL buffer unsets it. */
@@ -375,10 +381,11 @@ bool nmb_blit_copy_texture(NmbEncoder *, NmbTexture *source, uint64_t source_sli
                            const uint64_t size[3], NmbTexture *destination, uint64_t destination_slice, uint64_t destination_level,
                            const uint64_t destination_origin[3]);
 bool nmb_blit_buffer_to_texture(NmbEncoder *, NmbBuffer *source, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image,
-                                const uint64_t size[3], NmbTexture *destination, uint64_t slice, uint64_t level, const uint64_t origin[3]);
+                                const uint64_t size[3], NmbTexture *destination, uint64_t slice, uint64_t level, const uint64_t origin[3],
+                                uint64_t options /* MTLBlitOption */);
 bool nmb_blit_texture_to_buffer(NmbEncoder *, NmbTexture *source, uint64_t slice, uint64_t level, const uint64_t origin[3],
                                 const uint64_t size[3], NmbBuffer *destination, uint64_t offset, uint64_t bytes_per_row,
-                                uint64_t bytes_per_image);
+                                uint64_t bytes_per_image, uint64_t options /* MTLBlitOption */);
 bool nmb_blit_generate_mipmaps(NmbEncoder *, NmbTexture *);
 #ifdef __cplusplus
 }

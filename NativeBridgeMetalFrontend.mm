@@ -1310,6 +1310,14 @@ NB_RESOURCE_SPI
  if(isPvrtc(format))format=(MTLPixelFormat)pvrtcCarrier(format);
  return [self view:nmb_texture_new_view(_handle,format,type,l,s,false)];
 }
+// WebKit's WebGPU makes these for a texture view's swizzle (and to read a depth/stencil texture's one aspect).
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices
+                                        swizzle:(MTLTextureSwizzleChannels)swizzle {
+ const uint64_t l[2]={levels.location,levels.length},s[2]={slices.location,slices.length};
+ if(isPvrtc(format))format=(MTLPixelFormat)pvrtcCarrier(format);
+ const uint32_t channels=(uint32_t)swizzle.red|(uint32_t)swizzle.green<<8|(uint32_t)swizzle.blue<<16|(uint32_t)swizzle.alpha<<24;
+ return [self view:nmb_texture_new_view_swizzle(_handle,format,type,l,s,channels)];
+}
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
@@ -2731,6 +2739,27 @@ static void writeDrawStats() {
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o {
  [self drawIndexedPrimitives:t indexCount:n indexType:k indexBuffer:b indexBufferOffset:o instanceCount:1 baseVertex:0 baseInstance:0];
 }
+// WebGPU's drawIndirect and drawIndexedIndirect (the arguments are read on the GPU, so the draw dump shows none).
+- (void)indirectDraw:(MTLPrimitiveType)t indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
+      indirectBuffer:(id<MTLBuffer>)ib indirectBufferOffset:(NSUInteger)io {
+ if(b && ![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
+ if(![(id)ib isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign indirect buffer"];return;}
+ if(b)[self.commandBuffer.resourceOwners addObject:b];
+ [self.commandBuffer.resourceOwners addObject:ib];
+ if([self skipDraw])return;
+ gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
+ [self dumpDraw:b?@"indexed indirect":@"indirect"];
+ NmbBuffer *indices=b?[(NBBuffer *)b handle]:nullptr,*indirect=[(NBBuffer *)ib handle];
+ ENCODE([self check:nmb_render_draw_indirect(self.handle,t,k,indices,o,indirect,io) what:"indirect draw"]);
+}
+- (void)drawPrimitives:(MTLPrimitiveType)t indirectBuffer:(id<MTLBuffer>)ib indirectBufferOffset:(NSUInteger)io {
+ [self indirectDraw:t indexType:MTLIndexTypeUInt32 indexBuffer:nil indexBufferOffset:0 indirectBuffer:ib indirectBufferOffset:io];
+}
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
+               indirectBuffer:(id<MTLBuffer>)ib indirectBufferOffset:(NSUInteger)io {
+ if(!b){[self.commandBuffer refuse:@"indexed indirect draw without an index buffer"];return;}
+ [self indirectDraw:t indexType:k indexBuffer:b indexBufferOffset:o indirectBuffer:ib indirectBufferOffset:io];
+}
 // ---- tessellation ----
 // A buffer a patch draw reads, kept alive with the command buffer; NO (refused) for one this frontend did not make.
 - (BOOL)own:(id<MTLBuffer>)b what:(NSString *)what {
@@ -2844,6 +2873,13 @@ static void writeDrawStats() {
 - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
             sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
      destinationOrigin:(MTLOrigin)dO {
+ [self copyFromBuffer:s sourceOffset:o sourceBytesPerRow:row sourceBytesPerImage:image sourceSize:z toTexture:d destinationSlice:slice
+     destinationLevel:level destinationOrigin:dO options:MTLBlitOptionNone];
+}
+// options: a depth/stencil texture's one aspect (WebKit's WebGPU copies depth and stencil apart), or PVRTC rows.
+- (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
+            sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
+     destinationOrigin:(MTLOrigin)dO options:(MTLBlitOption)options {
  if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
  if(gLogTextures && textureLogTurn()) {
   const NmbTextureDescriptor t=[(NBTexture *)d descriptor];
@@ -2862,15 +2898,23 @@ static void writeDrawStats() {
   return;
  }
  const std::array<uint64_t,3> size={z.width,z.height,z.depth},b={dO.x,dO.y,dO.z};
- ENCODE([self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size.data(),[(NBTexture *)d handle],slice,level,b.data())
-                what:"copyFromBuffer:toTexture:"]);
+ const uint64_t opts=(uint64_t)options;
+ ENCODE([self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size.data(),[(NBTexture *)d handle],slice,level,b.data(),
+                                               opts) what:"copyFromBuffer:toTexture:"]);
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
                toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {
+ [self copyFromTexture:s sourceSlice:slice sourceLevel:level sourceOrigin:so sourceSize:z toBuffer:d destinationOffset:o destinationBytesPerRow:row
+       destinationBytesPerImage:image options:MTLBlitOptionNone];
+}
+- (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
+               toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image
+                options:(MTLBlitOption)options {
  if(![self textures:NB_OBJECTS(s) count:1] || ![self buffers:NB_OBJECTS(d) count:1])return;
  const std::array<uint64_t,3> a={so.x,so.y,so.z},size={z.width,z.height,z.depth};
- ENCODE([self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a.data(),size.data(),[(NBBuffer *)d handle],o,row,image)
-                what:"copyFromTexture:toBuffer:"]);
+ const uint64_t opts=(uint64_t)options;
+ ENCODE([self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a.data(),size.data(),[(NBBuffer *)d handle],o,row,image,
+                                               opts) what:"copyFromTexture:toBuffer:"]);
 }
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
  if(![self textures:NB_OBJECTS(t) count:1])return;
@@ -3158,6 +3202,25 @@ static char kUserDictionaryKey;
  gBlits++;encodedWork.blits++;
  NmbCommandBuffer *handle=_handle;
  return [self encoder:[NBBlitEncoder new] make:^{return nmb_blit_encoder_new(handle);} what:@"blitCommandEncoder"];
+}
+// The pass descriptors WebKit's WebGPU begins every compute pass and copy with. Their counter sample buffers (timestamp queries) have
+// nothing to sample: the device supports no counter sampling (supportsCounterSampling: answers NO), so one is noted and left out. A
+// concurrent compute pass runs serially, which keeps every ordering a concurrent one promises.
+static void noteSampleBuffers(id attachments,const char *what) {
+ for(NSUInteger k=0;k<4;k++) {
+  if(![attachments[k] sampleBuffer])continue;
+  static std::atomic<int> told{0};
+  if(told.fetch_add(1)<8)NBLOG(@"native-metal: %s with a counter sample buffer: not sampled",what);
+  return;
+ }
+}
+- (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDescriptor:(MTLComputePassDescriptor *)d {
+ noteSampleBuffers(d.sampleBufferAttachments,"compute pass");
+ return [self computeCommandEncoder];
+}
+- (id<MTLBlitCommandEncoder>)blitCommandEncoderWithDescriptor:(MTLBlitPassDescriptor *)d {
+ noteSampleBuffers(d.sampleBufferAttachments,"blit pass");
+ return [self blitCommandEncoder];
 }
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
  NmbRenderPassDescriptor pass={};

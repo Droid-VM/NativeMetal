@@ -1266,6 +1266,8 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (void)dealloc {nmb_texture_release(_handle);if(_surface){if(_counted)IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}}
 - (void)countUse {if(_surface && !_counted && gCountsSurfaceUse){IOSurfaceIncrementUseCount(_surface);_counted=YES;}}
 - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
+// The word an argument buffer holds for the texture (MTLArgumentEncoder writes the same); a view has its own.
+- (MTLResourceID)gpuResourceID {MTLResourceID id_;id_._impl=nmb_texture_resource_id(_handle);return id_;}
 - (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)(_pvrtc?_pvrtc:_descriptor.format);}
 - (NSUInteger)width {return _descriptor.width;}
 - (NSUInteger)height {return _descriptor.height;}
@@ -1451,6 +1453,8 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 @end
 
 // ---- libraries, functions, states ----
+// An argument encoder over the runtime's, or nil with the reason logged (defined with NBArgumentEncoder).
+static id<MTLArgumentEncoder> argumentEncoder(NmbArgumentEncoder *handle,const char *what);
 @interface NBLibrary : NBObject
 @property(nonatomic) NmbLibrary *handle;
 @property(nonatomic,strong) id storage;          // what keeps the metallib's bytes mapped: its functions' bitcode, for stitching
@@ -1499,6 +1503,13 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
  }
 }
 - (MTLFunctionOptions)options {return MTLFunctionOptionNone;}
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)index {
+ return _handle?argumentEncoder(nmb_function_argument_encoder(_handle,(uint32_t)index),"newArgumentEncoderWithBufferIndex"):nil;
+}
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)index reflection:(MTLAutoreleasedArgument *)reflection {
+ if(reflection)*reflection=nil;
+ return [self newArgumentEncoderWithBufferIndex:index];
+}
 - (MTLPatchType)patchType {return _handle?(MTLPatchType)nmb_function_patch_type(_handle):MTLPatchTypeNone;}
 - (NSInteger)patchControlPointCount {return _handle?(NSInteger)nmb_function_patch_control_point_count(_handle):0;}
 @end
@@ -1736,6 +1747,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 @end
 @implementation NBComputePipeline
 - (void)dealloc {nmb_compute_pipeline_release(_handle);}
+- (MTLResourceID)gpuResourceID {MTLResourceID id_;id_._impl=nmb_compute_pipeline_resource_id(_handle);return id_;}
 - (NSUInteger)maxTotalThreadsPerThreadgroup {return nmb_compute_pipeline_max_threads(_handle);}
 - (NSUInteger)threadExecutionWidth {return nmb_compute_pipeline_execution_width(_handle);}
 @end
@@ -1746,6 +1758,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 @end
 @implementation NBRenderPipeline
 - (void)dealloc {nmb_render_pipeline_release(_handle);}
+- (MTLResourceID)gpuResourceID {MTLResourceID id_;id_._impl=nmb_render_pipeline_resource_id(_handle);return id_;}
 // The threadgroup size a tile dispatch of this pipeline could use: the device's limit (no tile shaders are offered).
 - (NSUInteger)maxTotalThreadsPerThreadgroup {
  uint64_t s[3]={};if(!nmb_device_max_threads_per_threadgroup(gDevice,s))return 0;
@@ -1760,6 +1773,8 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
  NSMutableDictionary<NSString *,NBSampler *> *_clamped;
 }
 - (void)dealloc {nmb_sampler_release(_handle);}
+// The word an argument buffer holds for the sampler (MTLArgumentEncoder writes the same).
+- (MTLResourceID)gpuResourceID {MTLResourceID id_;id_._impl=nmb_sampler_resource_id(_handle);return id_;}
 - (NSUInteger)pixelFormat {return MTLPixelFormatInvalid;}   // SPI: a sampler built from a plain descriptor names no format
 // This sampler with its LOD clamps replaced (a binding's lodMinClamp:lodMaxClamp:, which GFXBench's Car Chase uses): made once per pair
 // and kept, at most 64 pairs (a caller that varies them every draw starts over rather than growing without bound).
@@ -1784,6 +1799,90 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 @implementation NBDepthStencil
 - (void)dealloc {nmb_depth_stencil_release(_handle);}
 @end
+
+// ---- argument encoders ----
+// MTLArgumentEncoder over the runtime's (nmb_argument_encoder_*): each argument is the 8 bytes a program could write itself (a buffer's
+// address plus the offset, any other object's gpuResourceID), written through the argument buffer's mapping at once, as Metal's encoder
+// writes them. Nothing is made resident by it: the command encoders' useResource:usage: does that. WebKit's WebGPU builds every bind
+// group with one; without them each of its BindGroupLayouts was invalid ("GPUDevice.createBindGroup: invalid BindGroupLayout").
+@interface NBArgumentEncoder : NBObject
+@property(nonatomic) NmbArgumentEncoder *handle;
+@property(nonatomic,strong) id<MTLBuffer> argumentBuffer;   // the buffer the encoder writes, kept while it is set
+@end
+@implementation NBArgumentEncoder
+- (void)dealloc {nmb_argument_encoder_release(_handle);}
+- (NSUInteger)encodedLength {return (NSUInteger)nmb_argument_encoder_encoded_length(_handle);}
+- (NSUInteger)alignment {return (NSUInteger)nmb_argument_encoder_alignment(_handle);}
+- (void)refused:(const char *)what {
+ static std::atomic<int> told{0};
+ if(told.fetch_add(1)<64)NBLOG(@"native-metal: argument encoder %s refused: %@",what,lastError());
+}
+- (void)foreign:(const char *)what {
+ static std::atomic<int> told{0};
+ if(told.fetch_add(1)<16)NBLOG(@"native-metal: argument encoder %s: an object this device did not make",what);
+}
+- (void)setArgumentBuffer:(id<MTLBuffer>)b startOffset:(NSUInteger)o arrayElement:(NSUInteger)e {
+ if(b && ![(id)b isKindOfClass:[NBBuffer class]]){[self foreign:"setArgumentBuffer"];return;}
+ if(!nmb_argument_encoder_set_argument_buffer(_handle,b?[(NBBuffer *)b handle]:nullptr,o,e)){[self refused:"setArgumentBuffer"];return;}
+ _argumentBuffer=b;
+}
+- (void)setArgumentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o {[self setArgumentBuffer:b startOffset:o arrayElement:0];}
+- (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {
+ if(b && ![(id)b isKindOfClass:[NBBuffer class]]){[self foreign:"setBuffer"];return;}
+ if(!nmb_argument_encoder_set_buffer(_handle,b?[(NBBuffer *)b handle]:nullptr,o,(uint32_t)i))[self refused:"setBuffer"];
+}
+- (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self setBuffer:b[k] offset:o[k] atIndex:r.location+k];
+}
+- (void)setTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
+ if(t && ![(id)t isKindOfClass:[NBTexture class]]){[self foreign:"setTexture"];return;}
+ if(!nmb_argument_encoder_set_texture(_handle,t?[(NBTexture *)t handle]:nullptr,(uint32_t)i))[self refused:"setTexture"];
+}
+- (void)setTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self setTexture:t[k] atIndex:r.location+k];
+}
+- (void)setSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {
+ if(s && ![(id)s isKindOfClass:[NBSampler class]]){[self foreign:"setSamplerState"];return;}
+ if(!nmb_argument_encoder_set_sampler(_handle,s?[(NBSampler *)s handle]:nullptr,(uint32_t)i))[self refused:"setSamplerState"];
+}
+- (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self setSamplerState:s[k] atIndex:r.location+k];
+}
+- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)p atIndex:(NSUInteger)i {
+ if(p && ![(id)p isKindOfClass:[NBRenderPipeline class]]){[self foreign:"setRenderPipelineState"];return;}
+ if(!nmb_argument_encoder_set_render_pipeline(_handle,p?[(NBRenderPipeline *)p handle]:nullptr,(uint32_t)i))[self refused:"setRenderPipelineState"];
+}
+- (void)setRenderPipelineStates:(const id<MTLRenderPipelineState> __unsafe_unretained [])p withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self setRenderPipelineState:p[k] atIndex:r.location+k];
+}
+- (void)setComputePipelineState:(id<MTLComputePipelineState>)p atIndex:(NSUInteger)i {
+ if(p && ![(id)p isKindOfClass:[NBComputePipeline class]]){[self foreign:"setComputePipelineState"];return;}
+ if(!nmb_argument_encoder_set_compute_pipeline(_handle,p?[(NBComputePipeline *)p handle]:nullptr,(uint32_t)i))[self refused:"setComputePipelineState"];
+}
+- (void)setComputePipelineStates:(const id<MTLComputePipelineState> __unsafe_unretained [])p withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self setComputePipelineState:p[k] atIndex:r.location+k];
+}
+- (void *)constantDataAtIndex:(NSUInteger)i {
+ void *at=nmb_argument_encoder_constant_data(_handle,(uint32_t)i);
+ if(!at)[self refused:"constantDataAtIndex"];
+ return at;
+}
+- (id<MTLArgumentEncoder>)newArgumentEncoderForBufferAtIndex:(NSUInteger)i {
+ NmbArgumentEncoder *nested=nmb_argument_encoder_nested(_handle,(uint32_t)i);
+ if(!nested){[self refused:"newArgumentEncoderForBufferAtIndex"];return nil;}
+ NBArgumentEncoder *encoder=[NBArgumentEncoder new];encoder.handle=nested;
+ return (id<MTLArgumentEncoder>)encoder;
+}
+@end
+static id<MTLArgumentEncoder> argumentEncoder(NmbArgumentEncoder *handle,const char *what) {
+ if(!handle) {
+  static std::atomic<int> told{0};
+  if(told.fetch_add(1)<64)NBLOG(@"native-metal: %s refused: %@",what,lastError());
+  return nil;
+ }
+ NBArgumentEncoder *encoder=[NBArgumentEncoder new];encoder.handle=handle;
+ return (id<MTLArgumentEncoder>)encoder;
+}
 
 // ---- events and fences ----
 @interface NBEvent : NBObject
@@ -1949,7 +2048,11 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic) uint32_t drawIndex;   // this encoder's draws so far, for NATIVE_METAL_SKIP_DRAWS   // [pipeline info, depth info, first draw, count] for each run of draws with one state
 - (void)noteState:(uint32_t)kind key:(uint32_t)key object:(const void *)object value:(uint64_t)value;
 - (void)noteDraw;
+- (void)use:(id<MTLResource>)resource usage:(MTLResourceUsage)usage stages:(uint64_t)stages;
+- (void)useHeap:(id<MTLHeap>)heap stagesRaw:(uint64_t)stages;
 @end
+// The runtime heap of a heap object (NBHeap is declared with the heaps, after the encoders); null for a foreign one.
+static NmbHeap *heapHandle(id heap);
 // NATIVE_METAL_DUMP_CB=FIRST[:COUNT]: the app's command buffers FIRST..FIRST+COUNT-1 (counted from 1, the plugin's own readbacks left
 // out) have what they rendered read back after them, by a command buffer of the plugin's own on the same queue: every render pass's
 // attachments and every texture a kernel could write, in the order first met. For each, standard error gets its channels' minimum,
@@ -2367,6 +2470,27 @@ static void writeDrawStats() {
  if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
  ENCODE([self check:nmb_encoder_set_texture(self->_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"]);
 }
+// useResource:usage:(stages:): a buffer or texture the encoder's later work reaches through an argument buffer (WebGPU's bind groups,
+// an app's argument buffers), made resident by the runtime and kept alive with the command buffer as a bound one is.
+- (void)use:(id<MTLResource>)resource usage:(MTLResourceUsage)usage stages:(uint64_t)stages {
+ if(!resource)return;
+ NmbBuffer *buffer=nullptr;NmbTexture *texture=nullptr;
+ if([(id)resource isKindOfClass:[NBBuffer class]])buffer=[(NBBuffer *)resource handle];
+ else if([(id)resource isKindOfClass:[NBTexture class]]) {
+  texture=[(NBTexture *)resource handle];
+  if([(NBTexture *)resource surface])[_commandBuffer.surfaces addObject:resource];
+ } else {[_commandBuffer refuse:@"foreign resource in useResource"];return;}
+ [_commandBuffer.resourceOwners addObject:resource];
+ const uint64_t u=(uint64_t)usage;
+ ENCODE([self check:nmb_encoder_use_resource(self->_handle,buffer,texture,u,stages) what:"useResource"]);
+}
+- (void)useHeap:(id<MTLHeap>)heap stagesRaw:(uint64_t)stages {
+ if(!heap)return;
+ NmbHeap *handle=heapHandle(heap);
+ if(!handle){[_commandBuffer refuse:@"foreign heap in useHeap"];return;}
+ [_commandBuffer.resourceOwners addObject:heap];
+ ENCODE([self check:nmb_encoder_use_heap(self->_handle,handle,stages) what:"useHeap"]);
+}
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
  [self dumpBind:sampler index:index stage:stage+8];
@@ -2445,7 +2569,12 @@ static void writeDrawStats() {
  const std::array<uint64_t,3> g={group.width,group.height,group.depth};
  ENCODE([self check:nmb_compute_dispatch_indirect(self.handle,[(NBBuffer *)buffer handle],offset,g.data()) what:"indirect dispatch"]);
 }
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)r;(void)u;}
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {[self use:r usage:u stages:0];}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n usage:(MTLResourceUsage)u {
+ for(NSUInteger k=0;k<n;k++)[self use:r[k] usage:u stages:0];
+}
+- (void)useHeap:(id<MTLHeap>)h {[self useHeap:h stagesRaw:0];}
+- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)n {for(NSUInteger k=0;k<n;k++)[self useHeap:h[k] stagesRaw:0];}
 - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
 @end
 
@@ -2647,7 +2776,23 @@ static void writeDrawStats() {
  if(!ci || !ib){[self.commandBuffer refuse:@"nil control point index or indirect buffer"];return;}
  [self patches:n start:0 count:0 patchIndex:pi offset:po points:ci offset:co instances:0 base:0 indirect:ib offset:io];
 }
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)r;(void)u;(void)s;}
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {[self use:r usage:u stages:(uint64_t)s];}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {
+ for(NSUInteger k=0;k<n;k++)[self use:r[k] usage:u stages:(uint64_t)s];
+}
+// The forms without stages (deprecated in Metal) reach both the vertex and fragment stages.
+- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {[self use:r usage:u stages:MTLRenderStageVertex|MTLRenderStageFragment];}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n usage:(MTLResourceUsage)u {
+ for(NSUInteger k=0;k<n;k++)[self use:r[k] usage:u stages:MTLRenderStageVertex|MTLRenderStageFragment];
+}
+- (void)useHeap:(id<MTLHeap>)h stages:(MTLRenderStages)s {[self useHeap:h stagesRaw:(uint64_t)s];}
+- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)n stages:(MTLRenderStages)s {
+ for(NSUInteger k=0;k<n;k++)[self useHeap:h[k] stagesRaw:(uint64_t)s];
+}
+- (void)useHeap:(id<MTLHeap>)h {[self useHeap:h stagesRaw:MTLRenderStageVertex|MTLRenderStageFragment];}
+- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)n {
+ for(NSUInteger k=0;k<n;k++)[self useHeap:h[k] stagesRaw:MTLRenderStageVertex|MTLRenderStageFragment];
+}
 - (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:true];}
 - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:false];}
 @end
@@ -3852,6 +3997,7 @@ static char dvmMemoryReleaseKey;
 @property(nonatomic) MTLResourceOptions options;
 @property(nonatomic) MTLHeapType heapType;
 @end
+static NmbHeap *heapHandle(id heap) {return [heap isKindOfClass:[NBHeap class]]?[(NBHeap *)heap handle]:nullptr;}
 @implementation NBHeap
 - (void)dealloc {nmb_heap_release(_handle);}
 - (NSUInteger)size {return nmb_heap_size(_handle);}
@@ -4512,6 +4658,12 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
  if(!row)NBLOG(@"native-metal: requiredLinearTextureBytesPerRow: %@",lastError());
  return row;
 }
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithArguments:(NSArray<MTLArgumentDescriptor *> *)arguments {
+ std::vector<NmbArgumentDescriptor> raw;raw.reserve(arguments.count);
+ for(MTLArgumentDescriptor *a in arguments)
+  raw.push_back({(uint32_t)a.dataType,(uint32_t)a.index,(uint32_t)a.arrayLength,(uint32_t)a.access,(uint32_t)a.textureType,(uint32_t)a.constantBlockAlignment});
+ return argumentEncoder(nmb_argument_encoder_new(gDevice,raw.data(),raw.size()),"newArgumentEncoderWithArguments");
+}
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d {
  NmbSamplerDescriptor s={(uint64_t)d.minFilter,(uint64_t)d.magFilter,(uint64_t)d.mipFilter,(uint64_t)d.sAddressMode,(uint64_t)d.tAddressMode,(uint64_t)d.rAddressMode,
      (uint64_t)d.borderColor,(uint64_t)d.normalizedCoordinates,d.maxAnisotropy,(uint64_t)d.compareFunction,(uint64_t)d.lodAverage,d.lodMinClamp,d.lodMaxClamp};
@@ -4663,7 +4815,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
    {"NBDepthStencil","MTLDepthStencilState"},{"NBEvent","MTLEvent"},{"NBSharedEvent","MTLSharedEvent"},{"NBFence","MTLFence"},
    {"NBQueue","MTLCommandQueue"},{"NBCommandBuffer","MTLCommandBuffer"},{"NBEncoder","MTLCommandEncoder"},
    {"NBComputeEncoder","MTLComputeCommandEncoder"},{"NBRenderEncoder","MTLRenderCommandEncoder"},{"NBBlitEncoder","MTLBlitCommandEncoder"},
-   {"NBHeap","MTLHeap"},{"NBBinaryArchive","MTLBinaryArchive"}};
+   {"NBHeap","MTLHeap"},{"NBBinaryArchive","MTLBinaryArchive"},{"NBArgumentEncoder","MTLArgumentEncoder"}};
   for(const auto &c:conformances){Class k=objc_getClass(c[0]);Protocol *pr=objc_getProtocol(c[1]);if(k&&pr)class_addProtocol(k,pr);}}
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];

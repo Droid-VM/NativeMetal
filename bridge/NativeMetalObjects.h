@@ -88,6 +88,29 @@ bool nmb_device_answer(const NmbDevice *, const char *selector, uint64_t arg, ui
 size_t nmb_device_vendor_name(const NmbDevice *, char *out, size_t size);
 size_t nmb_device_family_waivers(const NmbDevice *, char *out, size_t size); /* the target families' rows not met, one family per line */
 size_t nmb_device_family_blockers(const NmbDevice *, int64_t family, char *out, size_t size); /* a family's blocking rows and states, one per line */
+
+/* Argument encoders (MTLArgumentEncoder): each argument is 8 bytes, written through the argument buffer's mapping at once. */
+typedef struct NmbArgumentEncoder NmbArgumentEncoder;
+typedef struct {
+    uint32_t data_type, index, array_length, access, texture_type, constant_block_alignment;   /* raw Metal values */
+} NmbArgumentDescriptor;
+NmbArgumentEncoder *nmb_argument_encoder_new(const NmbDevice *, const NmbArgumentDescriptor *arguments, size_t count);
+NmbArgumentEncoder *nmb_function_argument_encoder(const NmbFunction *, uint32_t index);
+NmbArgumentEncoder *nmb_argument_encoder_nested(const NmbArgumentEncoder *, uint32_t index);
+void nmb_argument_encoder_release(NmbArgumentEncoder *);
+uint64_t nmb_argument_encoder_encoded_length(const NmbArgumentEncoder *);
+uint64_t nmb_argument_encoder_alignment(const NmbArgumentEncoder *);
+bool nmb_argument_encoder_set_argument_buffer(NmbArgumentEncoder *, const NmbBuffer *, uint64_t offset, uint64_t element);
+bool nmb_argument_encoder_set_buffer(const NmbArgumentEncoder *, const NmbBuffer *, uint64_t offset, uint32_t index);
+bool nmb_argument_encoder_set_texture(const NmbArgumentEncoder *, const NmbTexture *, uint32_t index);
+bool nmb_argument_encoder_set_sampler(const NmbArgumentEncoder *, const NmbSampler *, uint32_t index);
+bool nmb_argument_encoder_set_render_pipeline(const NmbArgumentEncoder *, const NmbRenderPipeline *, uint32_t index);
+bool nmb_argument_encoder_set_compute_pipeline(const NmbArgumentEncoder *, const NmbComputePipeline *, uint32_t index);
+void *nmb_argument_encoder_constant_data(const NmbArgumentEncoder *, uint32_t index);
+uint64_t nmb_texture_resource_id(const NmbTexture *);
+uint64_t nmb_sampler_resource_id(const NmbSampler *);
+uint64_t nmb_render_pipeline_resource_id(const NmbRenderPipeline *);
+uint64_t nmb_compute_pipeline_resource_id(const NmbComputePipeline *);
 uint64_t nmb_device_linear_bytes_per_row(const NmbDevice *, uint64_t format, uint64_t width); /* 0: refused */
 
 typedef struct NmbBinaryArchive NmbBinaryArchive;
@@ -287,6 +310,9 @@ NmbFence *nmb_fence_new(NmbDevice *);
 void nmb_fence_release(NmbFence *);
 /* stages: Metal's MTLRenderStages for a render encoder, ignored otherwise */
 bool nmb_encoder_update_fence(NmbEncoder *, NmbFence *, uint64_t stages);
+/* useResource:usage:(stages:) of a buffer (texture null) or a texture; useHeap:(stages:). stages are ignored on a compute encoder. */
+bool nmb_encoder_use_resource(NmbEncoder *, const NmbBuffer *, const NmbTexture *, uint64_t usage, uint64_t stages);
+bool nmb_encoder_use_heap(NmbEncoder *, const NmbHeap *, uint64_t stages);
 bool nmb_encoder_wait_fence(NmbEncoder *, NmbFence *, uint64_t stages);
 
 NmbEncoder *nmb_compute_encoder_new(NmbCommandBuffer *);

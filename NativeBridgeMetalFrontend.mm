@@ -2016,6 +2016,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
  BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
  std::vector<WatchedSource> watched;
  std::atomic<uint64_t> holdTicket;   // the display hold its commit took (displayhold), ended once the runtime has submitted it
+ std::atomic<uint64_t> surfaceTicket;   // the kernel's record of the IOSurfaces it uses (surfacesync), ended at its completion
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -2026,6 +2027,8 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic) uint32_t commitIndex;
 @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
 @property(nonatomic,strong) NSMutableSet *surfaces;
+// Of those, the textures it may write (attachments, blits, shader-writable textures and resources used for writing): surfacesync.
+@property(nonatomic,strong) NSMutableSet *writtenSurfaces;
 // Runtime handles retain GPU storage, but only the Objective-C owner retains
 // a no-copy deallocator, its memory owner and texture/heap ancestry.
 @property(nonatomic,strong) NSMutableSet *resourceOwners;
@@ -2310,6 +2313,70 @@ static void end(std::atomic<uint64_t> &ticket) {if(const uint64_t t=ticket.excha
 static std::mutex gDeferredLock;
 static NBCommandBuffer *gDeferred;
 }
+// The GPU's IOSurface accesses, for the kernel (the board's DroidVMVirtioGpu3D.cpp, surfaceAccess): a command buffer that uses
+// imported IOSurfaces names them as it commits (a ticket, each surface written or only read) and ends the ticket once it has
+// completed, and the kernel's IOSurface lock waits for the tickets begun before it, as IOSurfaceLock waits for the GPU on Apple's.
+// Without it WebKit's canvases, which CoreAnimation's Metal renderer draws and the CPU writes and reads in between, lost
+// putImageData's pixels to the drawing still queued and read back half-drawn ones. A connection of its own, as the display hold's;
+// a kernel without the op refuses the first ticket and the process asks no more.
+namespace surfacesync {
+static displayhold::CallFn gCall;
+static unsigned gConnection,gSelector=256;
+struct Record {uint32_t surface,written;};
+enum {kRecordsPerCall=256};
+// Begins a ticket (0), adds the records to one, or with none ends it; the ticket, 0 when refused.
+static uint64_t call(uint64_t ticket,const Record *records,uint32_t count) {
+ struct {uint32_t magic,method;uint64_t ticket;uint32_t count,pad;Record records[kRecordsPerCall];} in;
+ in.magic=0x4e544e4cu;in.method=0x7200+11;   // the tunnel's magic and the method (DROIDVM_VIRTGPU_METHOD + the surface op)
+ in.ticket=ticket;in.count=count;in.pad=0;
+ if(count)memcpy(in.records,records,count*sizeof(Record));
+ uint64_t out=0;size_t size=sizeof out;
+ return gCall(gConnection,gSelector,&in,sizeof in-sizeof in.records+count*sizeof(Record),&out,&size)==0?out:0;
+}
+static bool available() {
+ static const bool ok=[]{
+  if(access("/private/var/ngpu/debug/no-surface-sync",F_OK)==0)return false;
+  void *iokit=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW|RTLD_LOCAL);if(!iokit)return false;
+  auto matching=(CFMutableDictionaryRef (*)(const char *))dlsym(iokit,"IOServiceMatching");
+  auto service=(unsigned (*)(unsigned,CFDictionaryRef))dlsym(iokit,"IOServiceGetMatchingService");
+  auto open=(int (*)(unsigned,unsigned,uint32_t,unsigned *))dlsym(iokit,"IOServiceOpen");
+  auto release=(int (*)(unsigned))dlsym(iokit,"IOObjectRelease");
+  gCall=(displayhold::CallFn)dlsym(iokit,"IOConnectCallStructMethod");
+  if(!matching || !service || !open || !release || !gCall)return false;
+  const unsigned accelerator=service(0,matching("IOAcceleratorES"));if(!accelerator)return false;
+  const int status=open(accelerator,mach_task_self(),0x4149,&gConnection);release(accelerator);
+  if(status)return false;
+  const uint32_t probe[2]={0x4e544e4cu,0xffffffffu};
+  for(gSelector=0;gSelector<256;gSelector++)if(gCall(gConnection,gSelector,probe,sizeof probe,nullptr,nullptr)==0)break;
+  if(gSelector==256)return false;
+  const uint64_t ticket=call(0,nullptr,0);   // a kernel without the op refuses it
+  if(!ticket)return false;
+  call(ticket,nullptr,0);
+  return true;
+ }();
+ return ok;
+}
+// The IOSurfaces of `surfaces` (textures), each marked written when a texture of it is in `written`.
+static uint64_t begin(NSSet *surfaces,NSSet *written) {
+ if(!surfaces.count || !available())return 0;
+ std::vector<Record> records;records.reserve(surfaces.count);
+ for(NBTexture *texture in surfaces) {
+  IOSurfaceRef surface=texture.surface;if(!surface)continue;
+  const uint32_t id=IOSurfaceGetID(surface),write=[written containsObject:texture]?1:0;
+  auto same=std::find_if(records.begin(),records.end(),[&](const Record &r){return r.surface==id;});
+  if(same!=records.end())same->written|=write;else records.push_back({id,write});
+ }
+ uint64_t ticket=0;
+ for(size_t at=0;at<records.size();at+=kRecordsPerCall) {
+  const uint32_t count=(uint32_t)std::min<size_t>(kRecordsPerCall,records.size()-at);
+  const uint64_t answer=call(ticket,records.data()+at,count);
+  if(!ticket)ticket=answer;
+  if(!ticket)break;
+ }
+ return ticket;
+}
+static void end(std::atomic<uint64_t> &ticket) {if(const uint64_t t=ticket.exchange(0))call(t,nullptr,0);}
+}
 // Held while a resource wait reads an in-flight command buffer's runtime handle and while a locally refused command buffer frees it.
 static std::mutex gRuntimeHandleLock;
 static void waitForResource(id resource) {
@@ -2474,7 +2541,10 @@ static void writeDrawStats() {
  }
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
  [self dumpBind:texture index:index stage:stage+4];
- if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ if(texture && [(NBTexture *)texture surface]) {
+  [_commandBuffer.surfaces addObject:texture];
+  if(texture.usage&MTLTextureUsageShaderWrite)[_commandBuffer.writtenSurfaces addObject:texture];
+ }
  if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
  ENCODE([self check:nmb_encoder_set_texture(self->_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"]);
 }
@@ -2486,7 +2556,10 @@ static void writeDrawStats() {
  if([(id)resource isKindOfClass:[NBBuffer class]])buffer=[(NBBuffer *)resource handle];
  else if([(id)resource isKindOfClass:[NBTexture class]]) {
   texture=[(NBTexture *)resource handle];
-  if([(NBTexture *)resource surface])[_commandBuffer.surfaces addObject:resource];
+  if([(NBTexture *)resource surface]) {
+   [_commandBuffer.surfaces addObject:resource];
+   if(usage&MTLResourceUsageWrite)[_commandBuffer.writtenSurfaces addObject:resource];
+  }
  } else {[_commandBuffer refuse:@"foreign resource in useResource"];return;}
  [_commandBuffer.resourceOwners addObject:resource];
  const uint64_t u=(uint64_t)usage;
@@ -2842,7 +2915,7 @@ static void writeDrawStats() {
   id o=objects[i];
   if(![o isKindOfClass:[NBTexture class]]){[self.commandBuffer refuse:@"missing or foreign blit texture"];return false;}
   [self.commandBuffer.resourceOwners addObject:o];
-  if([(NBTexture *)o surface])[self.commandBuffer.surfaces addObject:o];
+  if([(NBTexture *)o surface]){[self.commandBuffer.surfaces addObject:o];[self.commandBuffer.writtenSurfaces addObject:o];}
  }
  return true;
 }
@@ -3103,7 +3176,7 @@ static char kUserDictionaryKey;
 // iPadOS 27: QuartzCore names the tasks a command buffer works for (GPU time attribution), on every buffer; there is no such accounting here.
 - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
 - (instancetype)init {
- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_writtenSurfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
  if(self){createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();sampleWindowOpen();}
  return self;
 }
@@ -3264,13 +3337,13 @@ static void noteSampleBuffers(id attachments,const char *what) {
  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
-  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
+  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];[_writtenSurfaces addObject:texture];}
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   if(a.resolveTexture) {
    if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
    NBTexture *resolve=(NBTexture *)a.resolveTexture;
-   [_resourceOwners addObject:resolve];if(resolve.surface)[_surfaces addObject:resolve];
+   [_resourceOwners addObject:resolve];if(resolve.surface){[_surfaces addObject:resolve];[_writtenSurfaces addObject:resolve];}
    out.resolve_texture=resolve.handle;out.resolve_level=a.resolveLevel;
    out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
   }
@@ -3339,10 +3412,11 @@ static void noteSampleBuffers(id attachments,const char *what) {
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
  displayhold::end(holdTicket);   // a command buffer that never scheduled (a refusal) holds no swap back
+ surfacesync::end(surfaceTicket);   // its GPU work is done: a lock of its surfaces waits for it no more
  flushSurfaces(_surfaces);
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
- [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
+ [_surfaces removeAllObjects];[_writtenSurfaces removeAllObjects];[_resourceOwners removeAllObjects];
  @synchronized(gInFlight){[gInFlight removeObject:self];}
  // Surfaces this command buffer kept alive may now have no other owner: their held imports go.
  trimHeldImports(false);
@@ -3397,6 +3471,7 @@ static void noteSampleBuffers(id attachments,const char *what) {
  dispatch_group_enter(_handlers);
  dispatch_group_enter(_schedulingHandlers);
  @synchronized(gInFlight){[gInFlight addObject:self];}
+ surfaceTicket=surfacesync::begin(_surfaces,_writtenSurfaces);   // before the commit returns: the caller may lock a surface next
  ENCODE([self submit]);
  encodeFlush();
 }

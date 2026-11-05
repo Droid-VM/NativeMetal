@@ -1007,8 +1007,40 @@ static void waitForResource(id resource);
 - (BOOL)isAliasable {return NO;} \
 - (int)setOwnerWithIdentity:(unsigned)identity {(void)identity;return 46; /* KERN_NOT_SUPPORTED */} \
 - (void)waitUntilComplete {waitForResource(self);}
+// What this process's Metal calls asked for and still hold, against what the runtime holds for them (nmb_memory_row): [0] textures of
+// their own memory, [1] buffers of their own memory, [2] heaps; bytes (the runtime's size of each) and counts. Views, textures over
+// buffers, heaps or IOSurfaces and no-copy buffers own no memory of their own and are not counted.
+static std::atomic<int64_t> gAskedBytes[3],gAskedCount[3];
+static void noteAsked(unsigned kind,int64_t bytes){if(!bytes)return;gAskedBytes[kind]+=bytes;gAskedCount[kind]+=bytes>0?1:-1;}
+// The counted textures and buffers themselves, for the largest of them (nmb_memory_top): bytes and what the texture is.
+struct AskedRecord {uint64_t bytes;NmbTextureDescriptor texture;bool isTexture;};
+static std::mutex gAskedLock;
+static std::unordered_map<const void *,AskedRecord> gAskedLive;
+// Kept only while /private/var/ngpu/debug/client-mem exists when the process starts (the plugin's memory writer reads them).
+static const bool gKeepAsked=access("/private/var/ngpu/debug/client-mem",F_OK)==0;
+static void keepAsked(const void *object,const AskedRecord &record){
+ if(!gKeepAsked)return;
+ std::lock_guard<std::mutex> lock(gAskedLock);gAskedLive[object]=record;
+}
+static void dropAsked(const void *object){if(!gKeepAsked)return;std::lock_guard<std::mutex> lock(gAskedLock);gAskedLive.erase(object);}
+// A counted resource's share, held by the resource and given back as it goes (the resources' own deallocs stay as the plugin build
+// script rewrites them).
+@interface NBAsked : NSObject
+@property(nonatomic) unsigned kind;
+@property(nonatomic) uint64_t bytes;
+@end
+@implementation NBAsked
+- (void)dealloc {noteAsked(_kind,-(int64_t)_bytes);dropAsked((__bridge const void *)self);}
+@end
+static NBAsked *askedToken(unsigned kind,uint64_t bytes,const NmbTextureDescriptor &descriptor) {
+ if(!bytes)return nil;
+ NBAsked *token=[NBAsked new];token.kind=kind;token.bytes=bytes;noteAsked(kind,(int64_t)bytes);
+ if(kind<2)keepAsked((__bridge const void *)token,{bytes,descriptor,kind==0});
+ return token;
+}
 @interface NBBuffer : NBObject
 @property(nonatomic) NmbBuffer *handle;
+@property(nonatomic,strong) NBAsked *asked;   // its bytes in gAskedBytes[1] while it lives; nil: not counted
 @property(nonatomic) MTLResourceOptions options;
 @property(nonatomic) void *wrapped;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
@@ -1018,6 +1050,7 @@ static void waitForResource(id resource);
 @end
 @interface NBTexture : NBObject
 @property(nonatomic) NmbTexture *handle;
+@property(nonatomic,strong) NBAsked *asked;   // its bytes in gAskedBytes[0] while it lives; nil: not counted
 @property(nonatomic) uint32_t pvrtc;   // the PVRTC format the texture was asked for, decoded into its RGBA8 (0: none)
 - (void)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes length:(size_t)length;
 @property(nonatomic) NmbTextureDescriptor descriptor;
@@ -2070,13 +2103,59 @@ static NmbHeap *heapHandle(id heap);
 // maximum and mean, its NaNs and infinities, and a 32x8 grid of brightness ('.' exactly black, 0-9, '+' above 1, '!' a NaN), from 64
 // rows spread down it: where a frame goes black or wrong, the first texture that does names the pass.
 static std::atomic<uint64_t> gAppCommits;
+// /private/var/ngpu/debug/dump-cb-now, for a process already running (the render server takes no environment of ours): while the file
+// is there when the process starts, pipelines and depth states keep their descriptions, and each change of its modification time
+// (looked at as command buffers are made, at most every 50 ms) dumps the next command buffers as NATIVE_METAL_DUMP_CB's, as many as
+// the file's first number says (default 20), every draw and blit written, standard error appended to dump-cb.txt in the process's
+// temporary directory from the first change on. A daemon's frame at a moment picked from outside: a gesture held mid-way.
+static std::atomic<uint64_t> gDumpNowFirst,gDumpNowCount;
+static bool dumpNowArmed() {static const bool armed=access("/private/var/ngpu/debug/dump-cb-now",F_OK)==0;return armed;}
 static std::pair<uint32_t,uint32_t> dumpRange() {
  static const std::pair<uint32_t,uint32_t> range=[]{
   unsigned first=0,count=0;const char *v=getenv("NATIVE_METAL_DUMP_CB");
   if(v && sscanf(v,"%u:%u",&first,&count)>=1)return std::make_pair((uint32_t)first,(uint32_t)(count?count:1));
   return std::make_pair(0u,0u);
  }();
- return range;
+ if(range.first || !dumpNowArmed())return range;
+ return std::make_pair((uint32_t)gDumpNowFirst.load(),(uint32_t)gDumpNowCount.load());
+}
+// Whether pipelines and depth states keep the descriptions the dump writes: a range from the environment, or dump-cb-now armed.
+static bool dumpDescribes() {return dumpRange().first || dumpNowArmed();}
+// dump-cb-now's poll, as a command buffer is made: a new modification time (the first look only notes it) dumps the app's command
+// buffers from the fourth after the last committed on, as many as the file's first number (default 20).
+static void dumpNowPoll() {
+ if(!dumpNowArmed())return;
+ static std::atomic<uint64_t> lastCheck,lastStamp;
+ const uint64_t now=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+ uint64_t last=lastCheck.load();
+ if(now-last<50000000ull || !lastCheck.compare_exchange_strong(last,now))return;
+ struct stat trigger;
+ if(stat("/private/var/ngpu/debug/dump-cb-now",&trigger)!=0)return;
+ const uint64_t stamp=(uint64_t)trigger.st_mtimespec.tv_sec*1000000000ull+(uint64_t)trigger.st_mtimespec.tv_nsec;
+ const uint64_t before=lastStamp.exchange(stamp);
+ if(!before || before==stamp)return;
+ unsigned count=20;
+ if(FILE *f=fopen("/private/var/ngpu/debug/dump-cb-now","r")){if(fscanf(f,"%u",&count)!=1 || !count)count=20;fclose(f);}
+ static std::once_flag redirected;
+ std::call_once(redirected,[]{
+  NSString *path=[NSTemporaryDirectory() stringByAppendingPathComponent:@"dump-cb.txt"];
+  if(freopen(path.fileSystemRepresentation,"a",stderr))setvbuf(stderr,nullptr,_IOLBF,0);
+ });
+ const uint64_t first=gAppCommits.load()+4;
+ fprintf(stderr,"native-metal dump-cb-now: command buffers %llu..%llu\n",(unsigned long long)first,(unsigned long long)(first+count-1));
+ gDumpNowCount=count;gDumpNowFirst=first;
+}
+// A texture in the dump's lines: its object (t and the address's bits), the IOSurface's id and the rotation of one over a surface,
+// and the texture a view is of.
+static NSString *dumpName(id texture) {
+ if(![texture isKindOfClass:[NBTexture class]])return texture?@"foreign":@"nil";
+ NBTexture *t=texture;const NmbTextureDescriptor d=t.descriptor;
+ NSMutableString *s=[NSMutableString stringWithFormat:@"t%llx",(unsigned long long)(((uintptr_t)(__bridge void *)t>>4)&0xffffff)];
+ if(t.surface)[s appendFormat:@" s%u",IOSurfaceGetID(t.surface)];
+ if(d.rotation)[s appendFormat:@" rot%llu",(unsigned long long)d.rotation];
+ if(d.framebuffer_only)[s appendString:@" fbonly"];
+ if(t.parent)[s appendFormat:@" view-of %@",dumpName(t.parent)];
+ return s;
 }
 // Whether a command buffer being encoded now may be one to dump: its number is not known until it commits, and others may commit first.
 static bool dumpMaybe(NBCommandBuffer *commandBuffer) {
@@ -2113,7 +2192,7 @@ static bool dumpShown(uint32_t draw) {
   if(v && sscanf(v,"%u:%u",&first,&last)!=2){first=1;last=6;}
   return std::make_pair(first,last);
  }();
- return draw>=shown.first && draw<=shown.second;
+ return dumpNowArmed() || (draw>=shown.first && draw<=shown.second);
 }
 // NATIVE_METAL_DUMP_DRAWS_MATCH=TEXT: also every draw whose pipeline's description holds TEXT (renderDumpInfo, e.g. "c5=f92b" for
 // the pipelines that blend into color 5), whatever its number.
@@ -2500,7 +2579,7 @@ static void writeDrawStats() {
                    k&0xff];
   if(kind==1 && [value isKindOfClass:[NBTexture class]]) {
    NBTexture *t=value;const NmbTextureDescriptor d=t.descriptor;
-   dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@: type %llu f%llu %llux%llux%llu array %llu mips %llu%@",where,(unsigned long long)d.type,
+   dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@: %@ type %llu f%llu %llux%llux%llu array %llu mips %llu%@",where,dumpName(t),(unsigned long long)d.type,
                             (unsigned long long)d.format,(unsigned long long)d.width,(unsigned long long)d.height,(unsigned long long)d.depth,
                             (unsigned long long)d.array_length,(unsigned long long)d.levels,t.label.length?[@" " stringByAppendingString:t.label]:@""]);
   } else if(kind==2 && [value isKindOfClass:[NBSampler class]]) {
@@ -2638,6 +2717,9 @@ static void writeDrawStats() {
 }
 - (void)dispatch:(MTLSize)size group:(MTLSize)group threads:(bool)threads {
  gDispatches++;self.commandBuffer->encodedWork.dispatches++;
+ if(dumpMaybe(self.commandBuffer))
+  [self dumpDraw:[NSString stringWithFormat:@"dispatch %lux%lux%lu %s %lux%lux%lu",(unsigned long)size.width,(unsigned long)size.height,
+                  (unsigned long)size.depth,threads?"threads":"groups",(unsigned long)group.width,(unsigned long)group.height,(unsigned long)group.depth]];
  const std::array<uint64_t,3> s={size.width,size.height,size.depth},g={group.width,group.height,group.depth};
  ENCODE([self check:nmb_compute_dispatch(self.handle,s.data(),g.data(),threads) what:"dispatch"]);
 }
@@ -2665,7 +2747,7 @@ static void writeDrawStats() {
 @implementation NBRenderEncoder
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
- if(dumpRange().first)self.dumpPipeline=state;
+ if(dumpDescribes())self.dumpPipeline=state;
  noteFormats(self.passKey|((uint64_t)((NBRenderPipeline *)state).stateFormat<<32));
  if(gDrawStats)[self noteState:kDSPipeline key:0 object:(__bridge const void *)state value:0];
  ENCODE([self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"]);
@@ -2705,7 +2787,7 @@ static void writeDrawStats() {
 }
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
- if(dumpRange().first)self.dumpDepth=state;
+ if(dumpDescribes())self.dumpDepth=state;
  if(gDrawStats)[self noteState:kDSDepth key:0 object:(__bridge const void *)state value:0];
  ENCODE([self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"]);
 }
@@ -2930,6 +3012,10 @@ static void writeDrawStats() {
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
+ if(dumpMaybe(self.commandBuffer))
+  dumpLine(self.commandBuffer,[NSString stringWithFormat:@"blit copy %@ slice %lu level %lu %lu,%lu %lux%lu -> %@ slice %lu level %lu %lu,%lu",dumpName(s),
+           (unsigned long)ss,(unsigned long)sl,(unsigned long)so.x,(unsigned long)so.y,(unsigned long)z.width,(unsigned long)z.height,dumpName(d),
+           (unsigned long)ds,(unsigned long)dl,(unsigned long)dO.x,(unsigned long)dO.y]);
  const std::array<uint64_t,3> a={so.x,so.y,so.z},size={z.width,z.height,z.depth},b={dO.x,dO.y,dO.z};
  ENCODE([self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a.data(),size.data(),[(NBTexture *)d handle],ds,dl,b.data())
                 what:"copyFromTexture:toTexture:"]);
@@ -2970,6 +3056,10 @@ static void writeDrawStats() {
   [(NBTexture *)d replacePvrtcRegion:MTLRegionMake2D(dO.x,dO.y,z.width,z.height) mipmapLevel:level slice:slice withBytes:contents+o length:std::min(want,have)];
   return;
  }
+ if(dumpMaybe(self.commandBuffer))
+  dumpLine(self.commandBuffer,[NSString stringWithFormat:@"blit buffer %lu+%lu rows %lu -> %@ slice %lu level %lu %lu,%lu %lux%lu",(unsigned long)[s length],
+           (unsigned long)o,(unsigned long)row,dumpName(d),(unsigned long)slice,(unsigned long)level,(unsigned long)dO.x,(unsigned long)dO.y,
+           (unsigned long)z.width,(unsigned long)z.height]);
  const std::array<uint64_t,3> size={z.width,z.height,z.depth},b={dO.x,dO.y,dO.z};
  const uint64_t opts=(uint64_t)options;
  ENCODE([self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size.data(),[(NBTexture *)d handle],slice,level,b.data(),
@@ -2984,6 +3074,10 @@ static void writeDrawStats() {
                toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image
                 options:(MTLBlitOption)options {
  if(![self textures:NB_OBJECTS(s) count:1] || ![self buffers:NB_OBJECTS(d) count:1])return;
+ if(dumpMaybe(self.commandBuffer))
+  dumpLine(self.commandBuffer,[NSString stringWithFormat:@"blit %@ slice %lu level %lu %lu,%lu %lux%lu -> buffer %lu+%lu",dumpName(s),(unsigned long)slice,
+           (unsigned long)level,(unsigned long)so.x,(unsigned long)so.y,(unsigned long)z.width,(unsigned long)z.height,(unsigned long)[d length],
+           (unsigned long)o]);
  const std::array<uint64_t,3> a={so.x,so.y,so.z},size={z.width,z.height,z.depth};
  const uint64_t opts=(uint64_t)options;
  ENCODE([self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a.data(),size.data(),[(NBBuffer *)d handle],o,row,image,
@@ -3313,9 +3407,10 @@ static void noteSampleBuffers(id attachments,const char *what) {
   NSMutableString *line=[NSMutableString stringWithFormat:@"pass %u %lux%lu",_dumpPasses,(unsigned long)d.renderTargetWidth,(unsigned long)d.renderTargetHeight];
   auto describe=[&](NSString *name,MTLRenderPassAttachmentDescriptor *a,NSString *clear) {
    if(!a.texture)return;
-   [line appendFormat:@"; %@ f%lu %lux%lu%@ load %lu store %lu%@%@",name,(unsigned long)a.texture.pixelFormat,(unsigned long)a.texture.width,
-    (unsigned long)a.texture.height,a.texture.storageMode==MTLStorageModeMemoryless?@" memoryless":@"",(unsigned long)a.loadAction,
-    (unsigned long)a.storeAction,a.loadAction==MTLLoadActionClear?clear:@"",a.resolveTexture?@" resolve":@""];
+   [line appendFormat:@"; %@ %@ f%lu %lux%lu%@ load %lu store %lu%@%@",name,dumpName(a.texture),(unsigned long)a.texture.pixelFormat,
+    (unsigned long)a.texture.width,(unsigned long)a.texture.height,a.texture.storageMode==MTLStorageModeMemoryless?@" memoryless":@"",
+    (unsigned long)a.loadAction,(unsigned long)a.storeAction,a.loadAction==MTLLoadActionClear?clear:@"",
+    a.resolveTexture?[@" resolve " stringByAppendingString:dumpName(a.resolveTexture)]:@""];
   };
   for(unsigned i=0;i<8;i++) {
    MTLClearColor c=d.colorAttachments[i].clearColor;
@@ -3593,6 +3688,7 @@ static void completed(void *context) {
 @implementation NBQueue
 - (void)dealloc {nmb_queue_release(_handle);}
 - (id<MTLCommandBuffer>)commandBuffer {
+ dumpNowPoll();
  NmbCommandBuffer *handle=nmb_command_buffer_new(_handle);
  if(!handle){NBLOG(@"native-metal: commandBuffer refused: %@",lastError());return nil;}
  NBCommandBuffer *commandBuffer=[NBCommandBuffer new];commandBuffer.handle=handle;commandBuffer.queue=self;return (id<MTLCommandBuffer>)commandBuffer;
@@ -4132,10 +4228,15 @@ static char dvmMemoryReleaseKey;
 
 @interface NBHeap : NBObject
 @property(nonatomic) NmbHeap *handle;
+@property(nonatomic,strong) NBAsked *asked;   // its bytes in gAskedBytes[2] while it lives
 @property(nonatomic) MTLResourceOptions options;
 @property(nonatomic) MTLHeapType heapType;
 @end
 static NmbHeap *heapHandle(id heap) {return [heap isKindOfClass:[NBHeap class]]?[(NBHeap *)heap handle]:nullptr;}
+static void countAskedTexture(NBTexture *texture,const NmbTextureDescriptor &descriptor) {
+ uint64_t answer[2]={0,0};NmbTextureDescriptor asked=descriptor;
+ if(nmb_device_heap_texture_size_and_align(gDevice,&asked,answer))texture.asked=askedToken(0,answer[0],descriptor);
+}
 @implementation NBHeap
 - (void)dealloc {nmb_heap_release(_handle);}
 - (NSUInteger)size {return nmb_heap_size(_handle);}
@@ -4182,6 +4283,9 @@ static NmbHeap *heapHandle(id heap) {return [heap isKindOfClass:[NBHeap class]]?
   if(offset!=UINT64_MAX)return nil;
   handle=nmb_texture_new(gDevice,&descriptor);
   if(!handle){NBLOG(@"native-metal: texture (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());return nil;}
+  NBTexture *own=[NBTexture new];own.handle=handle;countAskedTexture(own,descriptor);nmb_texture_describe(handle,&descriptor);own.descriptor=descriptor;
+  if(isPvrtc(d.pixelFormat))own.pvrtc=(uint32_t)d.pixelFormat;
+  own.parentHeap=(id<MTLHeap>)self;return (id<MTLTexture>)own;
  }
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
@@ -4367,7 +4471,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  if(!d)return nil;
  NmbHeap *handle=nmb_heap_new(gDevice,d.type,d.size,(uint64_t)d.resourceOptions);
  if(!handle){NBLOG(@"native-metal: heap refused: %@",lastError());return nil;}
- NBHeap *heap=[NBHeap new];heap.handle=handle;heap.options=d.resourceOptions;heap.heapType=d.type;return (id<MTLHeap>)heap;
+ NBHeap *heap=[NBHeap new];heap.handle=handle;heap.options=d.resourceOptions;heap.heapType=d.type;
+ {NmbTextureDescriptor none={};heap.asked=askedToken(2,nmb_heap_size(handle),none);}return (id<MTLHeap>)heap;
 }
 // A descriptor the runtime refuses answers {0, 0}, as Metal answers one it makes no texture of.
 - (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d {
@@ -4415,13 +4520,17 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);
  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
- NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
+ NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;
+ {NmbTextureDescriptor none={};none.options=options;buffer.asked=askedToken(1,length,none);}
+ return (id<MTLBuffer>)buffer;
 }
 - (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {
  if(!bytes)return nil;
  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,bytes);
  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
- NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
+ NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;
+ {NmbTextureDescriptor none={};none.options=options;buffer.asked=askedToken(1,length,none);}
+ return (id<MTLBuffer>)buffer;
 }
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
  void *context=deallocator?(__bridge_retained void *)[deallocator copy]:nullptr;
@@ -4443,7 +4552,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
         (unsigned long long)descriptor.format,(unsigned long long)descriptor.type,(unsigned long long)descriptor.levels,
         (unsigned long long)descriptor.usage,(unsigned long long)descriptor.options,handle?"made":"REFUSED");
  if(!handle){NBLOG(@"native-metal: texture (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());return nil;}
- NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+ NBTexture *texture=[NBTexture new];texture.handle=handle;countAskedTexture(texture,descriptor);nmb_texture_describe(handle,&descriptor);
+ texture.descriptor=descriptor;
  if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
  return (id<MTLTexture>)texture;
 }
@@ -4754,7 +4864,7 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
   return nil;
  }
  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;state.stateFormat=(uint32_t)d.colorAttachments[0].pixelFormat;gPipelines++;if(error)*error=nil;
- if(dumpRange().first)state.dumpInfo=renderDumpInfo(d);
+ if(dumpDescribes())state.dumpInfo=renderDumpInfo(d);
  return (id<MTLRenderPipelineState>)state;
 }
 // The asynchronous forms make the pipeline on the caller's thread and call the handler before returning, as the library's
@@ -4817,7 +4927,7 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
  NmbDepthStencil *handle=nmb_depth_stencil_new(gDevice,&s);
  if(!handle){NBLOG(@"native-metal: depth/stencil state refused: %@",lastError());return nil;}
  NBDepthStencil *state=[NBDepthStencil new];state.handle=handle;
- if(dumpRange().first)state.dumpInfo=[NSString stringWithFormat:@"compare %lu write %d%@",(unsigned long)d.depthCompareFunction,d.depthWriteEnabled,
+ if(dumpDescribes())state.dumpInfo=[NSString stringWithFormat:@"compare %lu write %d%@",(unsigned long)d.depthCompareFunction,d.depthWriteEnabled,
                                       d.frontFaceStencil.stencilCompareFunction!=MTLCompareFunctionAlways || d.frontFaceStencil.depthStencilPassOperation?@" stencil":@""];
  return (id<MTLDepthStencilState>)state;
 }
@@ -5068,6 +5178,47 @@ extern "C" size_t native_bridge_metal_benchmark(id device,const char *metallib,u
  }
  return at;
 }
+// What this process's Metal calls hold against what the runtime holds for them, MiB, in one row of at most 63 characters (a client's
+// text row; the render server's telemetry too): "Ma" textures/count buffers/count heaps | the runtime's pooled blocks/placed in them,
+// empty kept blocks, dedicated blocks, host imports, Turnip's cache of freed BOs. What the kernel's blobs hold past all of it is
+// Turnip's own (command streams, shaders).
+extern "C" size_t nmb_memory_row(char *out,size_t size) {
+ if(!out || !size)return 0;
+ out[0]=0;
+ uint64_t mc[10]={};
+ if(!gDevice || !nmb_device_memory_counts(gDevice,mc))return 0;
+ uint64_t bc[8]={};
+ static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
+ static void (*cacheStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_darwin_bo_cache_stats"):nullptr;
+ if(cacheStats)cacheStats(bc);
+ auto mib=[](int64_t b){return (long long)(b>>20);};
+ const int n=snprintf(out,size,"Ma t%lld/%lld b%lld/%lld h%lld|p%llu/%llu e%llu d%llu i%llu c%llu",
+  mib(gAskedBytes[0].load()),(long long)gAskedCount[0].load(),mib(gAskedBytes[1].load()),(long long)gAskedCount[1].load(),
+  mib(gAskedBytes[2].load()),(unsigned long long)(mc[0]>>20),(unsigned long long)(mc[1]>>20),(unsigned long long)(mc[2]>>20),
+  (unsigned long long)(mc[3]>>20),(unsigned long long)(mc[4]>>20),(unsigned long long)(bc[5]>>20));
+ return n>0?(size_t)n:0;
+}
+// The `count` largest counted textures and buffers, one line each: MiB (two decimals), then a texture's size, format, levels, samples,
+// array length, usage and options, or a buffer's options (the client memory file, startMemoryWriter).
+extern "C" size_t nmb_memory_top(char *out,size_t size,unsigned count) {
+ if(!out || !size)return 0;
+ out[0]=0;
+ std::vector<AskedRecord> records;
+ {std::lock_guard<std::mutex> lock(gAskedLock);records.reserve(gAskedLive.size());for(auto &entry:gAskedLive)records.push_back(entry.second);}
+ std::sort(records.begin(),records.end(),[](const AskedRecord &a,const AskedRecord &b){return a.bytes>b.bytes;});
+ size_t at=0;
+ for(unsigned i=0;i<records.size() && i<count;i++) {
+  const AskedRecord &r=records[i];const NmbTextureDescriptor &t=r.texture;
+  const int n=r.isTexture?
+   snprintf(out+at,size-at,"tex %.2f %llux%llux%llu f%llu L%llu s%llu a%llu u%llx o%llx%s\n",r.bytes/1048576.0,(unsigned long long)t.width,
+    (unsigned long long)t.height,(unsigned long long)t.depth,(unsigned long long)t.format,(unsigned long long)t.levels,(unsigned long long)t.samples,
+    (unsigned long long)t.array_length,(unsigned long long)t.usage,(unsigned long long)t.options,t.framebuffer_only?" fbonly":""):
+   snprintf(out+at,size-at,"buf %.2f o%llx\n",r.bytes/1048576.0,(unsigned long long)t.options);
+  if(n<=0 || (size_t)n>=size-at)break;
+  at+=(size_t)n;
+ }
+ return at;
+}
 // The telemetry table the plugin streams to the kernel's log: newline-separated rows of at most 90 characters.
 extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  size_t at=0;out[0]=0;
@@ -5169,6 +5320,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
     (unsigned long long)(mc[4]>>20),(unsigned long long)(mc[5]>>20),(unsigned long long)mc[6],(unsigned long long)mc[7],
     (unsigned long long)gTrimmedBlocks.load(),(unsigned long long)(bc[5]>>20),(unsigned long long)(bc[6]>>20),
     (unsigned long long)bc[2],(unsigned long long)bc[3]);
+   char asked[96];
+   if(nmb_memory_row(asked,sizeof asked))row("%s",asked);
   }
   // What held the runtime's batches back from the GPU (nmb_device_scheduler_counts): heads held for a host step and of them at their
   // gate (the GPU drained first), for an event value, behind an earlier commit; batches held and for how long; grouped submissions,

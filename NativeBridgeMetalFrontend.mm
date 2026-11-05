@@ -2271,12 +2271,20 @@ struct EncodeThread {
 };
 static thread_local bool tOnEncodeThread;
 static thread_local EncodeBatch *tBatch;
-// /private/var/ngpu/debug/encode-priority (read when the process starts): the thread runs round-robin at the fixed priority the file
-// holds (54 when empty: the render server's CoreAnimation display thread's) instead of the user-interactive QoS (37-46 in
-// backboardd). A frame reached the GPU about 3 ms after CoreAnimation committed it, the thread still translating the frame's calls:
-// on the guest's slower cores (capacity 762 against 1024) that was the GPU's idle time between frames. (Copying the first caller's
-// pthread policy gave 31: CoreAnimation's threads are not set through it.)
-static const bool gEncodePriority=access("/private/var/ngpu/debug/encode-priority",F_OK)==0;
+// In the render server (backboardd), and in any process while /private/var/ngpu/debug/encode-priority exists when it starts, the
+// thread runs round-robin at a fixed priority (the file's number; 54, CoreAnimation's frame-info and completion threads', without
+// one) instead of the user-interactive QoS, which backboardd clamps to 37-46: below every app's and SpringBoard's main thread (47),
+// while CoreAnimation's display thread waits on it for each frame (render-server thread 55). As an app opened, those main threads
+// took the CPU and the encode thread sat runnable a quarter of the time (11-06). Same boot, alternating A/B, 3 pairs of six
+// transitions, the switch in every process: intervals over 33 ms per 100 frames 21/5/24/26/14 -> 7/2/3/7/5, but the app switcher
+// 3.6 -> 10.8, apps' encode threads above their own main threads -- so by default only the render server's.
+// /private/var/ngpu/debug/no-encode-priority keeps the QoS everywhere. (Copying the first caller's pthread policy gave 31:
+// CoreAnimation's threads are not set through it.)
+static bool encodePriorityWanted() {
+ if(access("/private/var/ngpu/debug/no-encode-priority",F_OK)==0)return false;
+ return access("/private/var/ngpu/debug/encode-priority",F_OK)==0 || strcmp(getprogname(),"backboardd")==0;
+}
+static const bool gEncodePriority=encodePriorityWanted();
 static int gEncodePolicy=SCHED_RR;static sched_param gEncodeParam={};
 static std::atomic<int> gEncodePriorityStatus{-1};
 static EncodeThread &encodeThread() {

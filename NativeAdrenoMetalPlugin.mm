@@ -461,9 +461,6 @@ static id deviceForPort(unsigned port) {
         // A/B: while /private/var/ngpu/debug/no-lazy-bos exists when the process opens its device, Turnip offers no lazily allocated
         // memory (the board's patches/mesa/turnip-darwin-lazy-bos.patch off): memoryless textures take memory of their own again.
         if (access("/private/var/ngpu/debug/no-lazy-bos", F_OK) == 0) setenv("TU_DARWIN_LAZY_BOS", "0", 1);
-        // A/B: while /private/var/ngpu/debug/place-first exists when the process opens its device, a pooled placement takes the
-        // first block with room, in order (0032 off, METAL2VULKAN_PLACE_FIRST=1), not the fullest one.
-        if (access("/private/var/ngpu/debug/place-first", F_OK) == 0) setenv("METAL2VULKAN_PLACE_FIRST", "1", 1);
         // With the memory writer (client-mem, below) the runtime keeps a report of its pools' blocks too (0031).
         if (access("/private/var/ngpu/debug/client-mem", F_OK) == 0) setenv("METAL2VULKAN_POOL_REPORT", "1", 1);
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);

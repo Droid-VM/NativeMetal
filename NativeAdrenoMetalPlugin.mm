@@ -256,6 +256,44 @@ static void startPassReporter(unsigned port) {
         }
     }).detach();
 }
+// Diagnostic: while /private/var/ngpu/debug/client-mem exists when a process opens its device (the render server too), the process
+// writes every 5 s to m2v-mem.txt in its temporary directory, renamed into place whole: "<name> <pid> <unix time> <row>" (its memory
+// row, nmb_memory_row: what its Metal calls hold against what the runtime holds), its largest resources (nmb_memory_top), then the
+// runtime's placements by the source line that asked for them (m2v_placement_sites) and its pools' blocks (m2v_pool_report). The
+// kernel's per-client text rows hold 8 processes, and a wallpaper extension came after them.
+extern "C" size_t nmb_memory_row(char *out, size_t size) __attribute__((weak));
+extern "C" size_t nmb_memory_top(char *out, size_t size, unsigned count) __attribute__((weak));
+// The runtime's live placements by the source line that asked for them (the board's patches/metal2vulkan/0028).
+extern "C" size_t m2v_placement_sites(uint8_t *out, size_t size) __attribute__((weak));
+// Its pools' blocks: size, used, free ranges, longest free range (0031).
+extern "C" size_t m2v_pool_report(uint8_t *out, size_t size) __attribute__((weak));
+static void startMemoryWriter() {
+    if (!&nmb_memory_row || access("/private/var/ngpu/debug/client-mem", F_OK) != 0) return;
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    char dir[512];
+    if (!confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir - 32)) return;
+    std::string path = std::string(dir) + "m2v-mem.txt", partial = path + ".new";
+    std::thread([path, partial]{
+        pthread_setname_np("memory-writer");
+        for (;;) {
+            char row[128];
+            if (nmb_memory_row(row, sizeof row) && row[0])
+                if (FILE *file = fopen(partial.c_str(), "w")) {
+                    fprintf(file, "%s %d %ld %s\n", getprogname(), getpid(), (long)time(nullptr), row);
+                    // Then the 24 largest textures and buffers its Metal calls hold.
+                    static char top[4096];
+                    if (&nmb_memory_top && nmb_memory_top(top, sizeof top, 24)) fputs(top, file);
+                    // Then where the runtime's own placements came from (shadows, twins, staging): "site MiB count file:line".
+                    if (&m2v_placement_sites && m2v_placement_sites(reinterpret_cast<uint8_t *>(top), sizeof top)) fputs(top, file);
+                    if (&m2v_pool_report && m2v_pool_report(reinterpret_cast<uint8_t *>(top), sizeof top)) fputs(top, file);
+                    fclose(file);
+                    rename(partial.c_str(), path.c_str());
+                }
+            sleep(5);
+        }
+    }).detach();
+}
 // The runtime's pooled block size for a test, from /private/var/ngpu/debug/block-mib (the board's patches/metal2vulkan/0019; 64 MiB, the
 // runtime's own, without it). Every block is wired guest memory here, but 16 MiB blocks hung the render server's GPU context on 3 of 5
 // app open/close cycles (0 of 5 at 64: more images take dedicated blocks and spares), so smaller blocks stay a test.
@@ -266,6 +304,26 @@ static void boundPooledBlocks() {
         fclose(file);
     }
     if (text[0]) setenv("METAL2VULKAN_BLOCK_MIB", text, 0);
+}
+// A client's cache of freed BOs (Turnip's darwin backend: TU_DARWIN_BO_CACHE_MB, 96 by default, and TU_DARWIN_BO_CACHE_SMALL_MB for BOs
+// of at most 1 MiB, 16): 16 and 8 MiB in every process but the render server, which keeps the defaults. Every BO is wired guest memory
+// and each resident client kept its cache full: the wallpaper extension held 56 MiB of freed BOs for a still picture, widgets and
+// SpringBoard 30-40 MiB each. A test's sizes from /private/var/ngpu/debug/client-bo-cache-mb ("BIG SMALL" in MiB; a BIG of 0 is no
+// limit, as Turnip reads it).
+static void boundClientBoCache() {
+    unsigned big = 16, small = 8;
+    if (FILE *file = fopen("/private/var/ngpu/debug/client-bo-cache-mb", "r")) {
+        unsigned b = 0, s = 0;
+        const int n = fscanf(file, "%u %u", &b, &s);
+        if (n >= 1) big = b;
+        if (n >= 2) small = s;
+        fclose(file);
+    }
+    char text[16];
+    snprintf(text, sizeof text, "%u", big);
+    setenv("TU_DARWIN_BO_CACHE_MB", text, 0);
+    snprintf(text, sizeof text, "%u", small);
+    setenv("TU_DARWIN_BO_CACHE_SMALL_MB", text, 0);
 }
 static id clientDevice(unsigned port) {
     char turnip[1024];
@@ -278,6 +336,7 @@ static id clientDevice(unsigned port) {
     // IOSurfaces this GPU reads or writes must be plain rows, as in the render server.
     CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
     boundPooledBlocks();
+    boundClientBoCache();
     char candidates[2][512] = {};
     if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
     if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
@@ -316,6 +375,7 @@ static id clientDevice(unsigned port) {
     if (device) {
         gClientPort = port;
         startPassReporter(port);
+        startMemoryWriter();
         native_bridge_metal_problem_hook = [](const char *problem) {clientFailure(gClientPort, "problem", problem);};
         char problem[200] = {};
         if (native_bridge_metal_first_problem(problem, sizeof problem) && problem[0]) clientFailure(port, "problem", problem);
@@ -384,6 +444,28 @@ static id deviceForPort(unsigned port) {
         // so a later draw that writes the color no longer splits the pass: Core Animation's 2048x2732 frame passes split so at almost
         // every frame (the PS row's ml), storing and loading the whole frame again on the tiler.
         if (access("/private/var/ngpu/debug/no-inline-memoryless", F_OK) == 0) setenv("METAL2VULKAN_INLINE_MEMORYLESS", "0", 1);
+        // A/B: while /private/var/ngpu/debug/bo-cache-unsplit exists when the process opens its device, Turnip's freed-BO cache keeps
+        // every BO in one budget, as before the fork's patches/mesa/turnip-darwin-bo-cache-small-budget.patch (TU_DARWIN_BO_CACHE_SMALL_MB=0).
+        if (access("/private/var/ngpu/debug/bo-cache-unsplit", F_OK) == 0) setenv("TU_DARWIN_BO_CACHE_SMALL_MB", "0", 1);
+        // A/B: /private/var/ngpu/debug/keep-room-mib, read when the process opens its device: the most room the runtime keeps in
+        // each of its pools for its encodings (the board's patches/metal2vulkan/0027, METAL2VULKAN_KEEP_ROOM_MIB), half a block
+        // without it. The room is one free range: the render server's pooled blocks were half empty.
+        if (FILE *file = fopen("/private/var/ngpu/debug/keep-room-mib", "r")) {
+            char text[16] = {};
+            if (fgets(text, sizeof text, file) && text[0] >= '0' && text[0] <= '9') setenv("METAL2VULKAN_KEEP_ROOM_MIB", text, 1);
+            fclose(file);
+        }
+        // A/B: while /private/var/ngpu/debug/no-backing-cover exists when the process opens its device, each memoryless color
+        // backing serves only its own extent (the board's patches/metal2vulkan/0029 off, METAL2VULKAN_BACKING_COVER=0).
+        if (access("/private/var/ngpu/debug/no-backing-cover", F_OK) == 0) setenv("METAL2VULKAN_BACKING_COVER", "0", 1);
+        // A/B: while /private/var/ngpu/debug/no-lazy-bos exists when the process opens its device, Turnip offers no lazily allocated
+        // memory (the board's patches/mesa/turnip-darwin-lazy-bos.patch off): memoryless textures take memory of their own again.
+        if (access("/private/var/ngpu/debug/no-lazy-bos", F_OK) == 0) setenv("TU_DARWIN_LAZY_BOS", "0", 1);
+        // A/B: while /private/var/ngpu/debug/place-first exists when the process opens its device, a pooled placement takes the
+        // first block with room, in order (0032 off, METAL2VULKAN_PLACE_FIRST=1), not the fullest one.
+        if (access("/private/var/ngpu/debug/place-first", F_OK) == 0) setenv("METAL2VULKAN_PLACE_FIRST", "1", 1);
+        // With the memory writer (client-mem, below) the runtime keeps a report of its pools' blocks too (0031).
+        if (access("/private/var/ngpu/debug/client-mem", F_OK) == 0) setenv("METAL2VULKAN_POOL_REPORT", "1", 1);
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
@@ -548,6 +630,7 @@ static id deviceForPort(unsigned port) {
             return nil;
         }
         gpu->mark(0x6802);
+        startMemoryWriter();
         // The status line (GPU8) every ten seconds (sheng-diag=1), and the display hand-off client on its own thread: both only read or serve,
         // neither is the discovery's.
         pthread_t monitor, scanout;

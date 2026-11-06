@@ -749,16 +749,62 @@ static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescripto
 // what Metal reads. The runtime's own texture of it is an RGBA16F image of the converted texels plus a staging copy of the planes
 // (about 100 MiB at 4K) per texture made, and the server makes one at every frame it is refused: refused, the wallpaper layer is never
 // drawn, and the screen keeps whatever a window left where the desktop shows again. The cache answers the same texture while the
-// surface's seed is unchanged (a new one when it changes, the old one left to the command buffers that hold it). Formats: the converted
+// surface's contents are unchanged (a new one when they change, the old one left to the command buffers that hold it). Formats: the converted
 // 8-bit 500, 502, 503 (RGBA8) and their _sRGB twins 520, 522, 523 (an _sRGB texture of the same bytes), the converted 10-bit 505, 506,
 // 507 (RGB10A2), and the code formats 540, 541, 542 and 543, 544, 545 (red Cr, green Y, blue Cb; RGBA8 and RGB10A2), for a texture the
 // shaders only read. The matrix is the surface's IOSurfaceYCbCrMatrix (BT.601 without one, as Metal), the range its OSType's ('...f'
 // full, else video); 10-bit codes are the high 10 bits of 16-bit words.
-struct ConvertedYCbCr {uint32_t surface,seed,format;__strong id<MTLTexture> texture;};
+// A converted texture is a copy, but the server keeps its texture of a surface while the surface lives (a video's few pool surfaces,
+// written again at every frame): each use of the texture (texture:index:stage:) converts again first where the surface's seed or a
+// sparse sum of its luma changed since (the sum for writers that do not lock the surface: Aerials' lock-screen video showed its pool's
+// first frames again and again, a9531ab).
+struct YCbCrConversion {unsigned sub,bits,scale;bool codes;size_t w,h;std::vector<int32_t> table;};
+// The texture weak: the server's references keep it, the cache does not.
+struct ConvertedYCbCr {uint32_t surface,seed,format,sum;IOSurfaceRef source;YCbCrConversion conversion;__weak id<MTLTexture> texture;};
 static std::mutex gConvertedLock;
 static ConvertedYCbCr gConverted[4];
-static std::atomic<uint64_t> gConvertedMade,gConvertedReused;
+static std::atomic<uint64_t> gConvertedMade,gConvertedReused,gConvertedRefreshed;
+static uint32_t lumaSum(IOSurfaceRef surface) {
+ const uint8_t *y=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,0);
+ const size_t row=IOSurfaceGetBytesPerRowOfPlane(surface,0),h=IOSurfaceGetHeightOfPlane(surface,0);
+ uint32_t sum=2166136261u;
+ if(y && row && h>=64)for(size_t r=h/64;r<h;r+=h/32)for(size_t x=0;x<row;x+=97)sum=(sum^y[r*row+x])*16777619u;
+ return sum;
+}
+// The surface's planes into the texture, bands of 64 rows on all cores.
+static bool convertYCbCr(id<MTLTexture> texture,IOSurfaceRef surface,const YCbCrConversion &c) {
+ if(IOSurfaceLock(surface,kIOSurfaceLockReadOnly,nullptr))return false;
+ const uint8_t *luma=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,0),*chroma=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,1);
+ const size_t lumaRow=IOSurfaceGetBytesPerRowOfPlane(surface,0),chromaRow=IOSurfaceGetBytesPerRowOfPlane(surface,1),w=c.w,h=c.h;
+ const unsigned levels=1u<<c.bits,sub=c.sub,bits=c.bits,scale=c.scale;const bool codes=c.codes;
+ const int32_t *yT=c.table.data(),*rCr=yT+levels,*gCb=rCr+levels,*gCr=gCb+levels,*bCb=gCr+levels;
+ auto clamp=[scale](int32_t v)->uint32_t{v=(v+32768)>>16;return v<0?0u:(uint32_t)v>scale?scale:(uint32_t)v;};
+ std::vector<uint32_t> pixels(w*h);
+ uint32_t *const out=pixels.data();
+ dispatch_apply((h+63)/64,dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^(size_t band) {
+  for(size_t y=band*64;y<h && y<band*64+64;y++) {
+   const uint8_t *yr=luma+y*lumaRow,*cr=chroma+(y>>(sub==2?1:0))*chromaRow;
+   uint32_t *line=out+y*w;
+   for(size_t x=0;x<w;x++) {
+    const size_t cx=x>>(sub?1:0);
+    unsigned Y,Cb,Cr;
+    if(bits==8){Y=yr[x];Cb=cr[cx*2];Cr=cr[cx*2+1];}
+    else{Y=((const uint16_t *)yr)[x]>>6;Cb=((const uint16_t *)cr)[cx*2]>>6;Cr=((const uint16_t *)cr)[cx*2+1]>>6;}
+    const int32_t L=yT[Y];
+    const uint32_t r=clamp(codes?rCr[Cr]:L+rCr[Cr]),g=clamp(L+gCb[Cb]+gCr[Cr]),b=clamp(codes?bCb[Cb]:L+bCb[Cb]);
+    line[x]=bits==8?r|g<<8|b<<16|0xff000000u:r|g<<10|b<<20|0xc0000000u;
+   }
+  }
+ });
+ IOSurfaceUnlock(surface,kIOSurfaceLockReadOnly,nullptr);
+ [texture replaceRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0 withBytes:pixels.data() bytesPerRow:w*4];
+ return true;
+}
 static id<MTLTexture> convertedYCbCrTexture(id device,MTLTextureDescriptor *d,IOSurfaceRef surface,NSUInteger plane) {
+ // WindowServer's alone: a copy the CPU makes at encoding misses what the GPU has yet to write, and VTDecoderXPCService's HEVC decoder
+ // reads its reference frames through such textures (the frames after a key frame grey but for what moves, until the next key frame).
+ static const bool server=!strcmp(getprogname(),"WindowServer");
+ if(!server)return nil;
  const NSUInteger f=d.pixelFormat;
  // sub: 2 4:2:0, 1 4:2:2, 0 4:4:4 (the format's last digit after 500/505/520/540/543: 0, 2, 3 / 0, 1, 2)
  unsigned sub=3,bits=8;bool codes=false,srgb=false;
@@ -783,11 +829,12 @@ static id<MTLTexture> convertedYCbCrTexture(id device,MTLTextureDescriptor *d,IO
  const size_t w=IOSurfaceGetWidthOfPlane(surface,0),h=IOSurfaceGetHeightOfPlane(surface,0);
  if(w!=d.width || h!=d.height || IOSurfaceGetBytesPerElementOfPlane(surface,0)!=unit || IOSurfaceGetBytesPerElementOfPlane(surface,1)!=2*unit ||
     IOSurfaceGetWidthOfPlane(surface,1)<(w+(sub?1:0))>>(sub?1:0) || IOSurfaceGetHeightOfPlane(surface,1)<(h+(sub==2?1:0))>>(sub==2?1:0))return nil;
- const uint32_t sid=IOSurfaceGetID(surface),seed=IOSurfaceGetSeed(surface);
+ const uint32_t sid=IOSurfaceGetID(surface),seed=IOSurfaceGetSeed(surface),sum=lumaSum(surface);
  {
   std::lock_guard<std::mutex> lock(gConvertedLock);
   for(ConvertedYCbCr &entry:gConverted)
-   if(entry.texture && entry.surface==sid && entry.seed==seed && entry.format==f){gConvertedReused++;return entry.texture;}
+   if(entry.surface==sid && entry.seed==seed && entry.sum==sum && entry.format==f)
+    if(id<MTLTexture> cached=entry.texture){gConvertedReused++;return cached;}
  }
  const uint32_t ostype=IOSurfaceGetPixelFormat(surface);
  const bool full=(ostype&0xff)=='f';
@@ -803,8 +850,8 @@ static id<MTLTexture> convertedYCbCrTexture(id device,MTLTextureDescriptor *d,IO
  // code formats read each code alone, code / (2^bits - 1).
  const unsigned levels=1u<<bits,top=levels-1,scale=bits==8?255:1023;
  const double kg=1-kr-kb,mid=levels/2,yo=full?0:16<<(bits-8),ys=full?1.0/top:1.0/(219<<(bits-8)),cs=full?1.0/top:1.0/(224<<(bits-8));
- std::vector<int32_t> table((size_t)levels*5);
- int32_t *yT=table.data(),*rCr=yT+levels,*gCb=rCr+levels,*gCr=gCb+levels,*bCb=gCr+levels;
+ YCbCrConversion conversion{sub,bits,scale,codes,w,h,std::vector<int32_t>((size_t)levels*5)};
+ int32_t *yT=conversion.table.data(),*rCr=yT+levels,*gCb=rCr+levels,*gCr=gCb+levels,*bCb=gCr+levels;
  for(unsigned i=0;i<levels;i++) {
   const double y=codes?(double)i/top:(i-yo)*ys,c=(i-mid)*cs;
   yT[i]=(int32_t)lround(y*scale*65536);
@@ -816,30 +863,8 @@ static id<MTLTexture> convertedYCbCrTexture(id device,MTLTextureDescriptor *d,IO
  rgba.usage=MTLTextureUsageShaderRead;
  id<MTLTexture> texture=[device newTextureWithDescriptor:rgba];
  if(!texture)return nil;
- std::vector<uint32_t> rows((size_t)w*64);
- if(IOSurfaceLock(surface,kIOSurfaceLockReadOnly,nullptr))return nil;
- const uint8_t *luma=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,0),*chroma=(const uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface,1);
- const size_t lumaRow=IOSurfaceGetBytesPerRowOfPlane(surface,0),chromaRow=IOSurfaceGetBytesPerRowOfPlane(surface,1);
- auto clamp=[scale](int32_t v)->uint32_t{v=(v+32768)>>16;return v<0?0u:(uint32_t)v>scale?scale:(uint32_t)v;};
  const uint64_t began=nowUs();
- for(size_t y0=0;y0<h;y0+=64) {
-  const size_t band=h-y0<64?h-y0:64;
-  for(size_t dy=0;dy<band;dy++) {
-   const uint8_t *yr=luma+(y0+dy)*lumaRow,*cr=chroma+((y0+dy)>>(sub==2?1:0))*chromaRow;
-   uint32_t *line=rows.data()+dy*w;
-   for(size_t x=0;x<w;x++) {
-    const size_t cx=x>>(sub?1:0);
-    unsigned Y,Cb,Cr;
-    if(bits==8){Y=yr[x];Cb=cr[cx*2];Cr=cr[cx*2+1];}
-    else{Y=((const uint16_t *)yr)[x]>>6;Cb=((const uint16_t *)cr)[cx*2]>>6;Cr=((const uint16_t *)cr)[cx*2+1]>>6;}
-    const int32_t L=yT[Y];
-    const uint32_t r=clamp(codes?rCr[Cr]:L+rCr[Cr]),g=clamp(L+gCb[Cb]+gCr[Cr]),b=clamp(codes?bCb[Cb]:L+bCb[Cb]);
-    line[x]=bits==8?r|g<<8|b<<16|0xff000000u:r|g<<10|b<<20|0xc0000000u;
-   }
-  }
-  [texture replaceRegion:MTLRegionMake2D(0,y0,w,band) mipmapLevel:0 withBytes:rows.data() bytesPerRow:w*4];
- }
- IOSurfaceUnlock(surface,kIOSurfaceLockReadOnly,nullptr);
+ if(!convertYCbCr(texture,surface,conversion))return nil;
  gConvertedMade++;
  NSLog(@"native-metal: surface %#x (%c%c%c%c seed %u) converted to a %zux%zu %s texture for format %lu in %llu ms (made %llu, reused %llu)",sid,
   (char)(ostype>>24),(char)(ostype>>16),(char)(ostype>>8),(char)ostype,seed,w,h,bits==8?"RGBA8":"RGB10A2",(unsigned long)f,
@@ -849,8 +874,22 @@ static id<MTLTexture> convertedYCbCrTexture(id device,MTLTextureDescriptor *d,IO
  ConvertedYCbCr *slot=nullptr;   // the surface's own entry for this format (its contents changed), else the next in turn
  for(ConvertedYCbCr &entry:gConverted)if(entry.texture && entry.surface==sid && entry.format==f)slot=&entry;
  if(!slot)slot=&gConverted[next++%4];
- slot->surface=sid;slot->seed=seed;slot->format=(uint32_t)f;slot->texture=texture;
+ if(slot->source)CFRelease(slot->source);
+ slot->surface=sid;slot->seed=seed;slot->sum=sum;slot->format=(uint32_t)f;slot->source=(IOSurfaceRef)CFRetain(surface);
+ slot->conversion=std::move(conversion);slot->texture=texture;
  return texture;
+}
+// Before a use of a converted texture: convert its surface again where its contents changed since the last conversion.
+static void refreshConvertedYCbCr(id<MTLTexture> texture) {
+ if(!texture)return;
+ std::lock_guard<std::mutex> lock(gConvertedLock);
+ for(ConvertedYCbCr &entry:gConverted) {
+  if(entry.texture!=texture || !entry.source)continue;
+  const uint32_t seed=IOSurfaceGetSeed(entry.source),sum=lumaSum(entry.source);
+  if(seed==entry.seed && sum==entry.sum)return;
+  if(convertYCbCr(texture,entry.source,entry.conversion)){entry.seed=seed;entry.sum=sum;gConvertedRefreshed++;}
+  return;
+ }
 }
 static void noteFormat(uint32_t format,bool made) {
  std::lock_guard<std::mutex> lock(gProblemLock);
@@ -2894,6 +2933,7 @@ static void writeDrawStats() {
 }
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
+ refreshConvertedYCbCr(texture);
  if(gDrawStats)[self noteState:kDSTexture key:stage<<8|(uint32_t)index object:(__bridge const void *)texture value:0];
  if(texture && stage==0 && (texture.usage&MTLTextureUsageShaderWrite) && dumpMaybe(_commandBuffer)) {
   if(!_dumpEntries)_dumpEntries=[NSMutableArray array];

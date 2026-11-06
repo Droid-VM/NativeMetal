@@ -31,6 +31,8 @@ use std::ptr::NonNull;
 use std::time::Duration;
 use metal2vulkan_runtime::{CommandBufferError, FailureOrigin, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter};
 use metal2vulkan_runtime::{ArgumentEncoder, ResourceRef};
+use metal2vulkan_runtime::{IndirectCommandBuffer, IndirectCommandBufferDescriptor, IndirectComputeCommand, IndirectRenderCommand};
+use metal2vulkan::metal::{BarrierScope, IndirectCommandType};
 
 thread_local! {
     static LAST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -1834,6 +1836,8 @@ pub struct NmbRenderPipelineDescriptor {
     pub vertex_preloaded_count: u64,
     pub fragment_preloaded: *const *mut NmbDynamicLibrary,
     pub fragment_preloaded_count: u64,
+    /// `supportIndirectCommandBuffers`: an indirect command may name the state.
+    pub indirect: u64,
 }
 
 /// A post-tessellation vertex function's state; `tessellates` 0 leaves the descriptor's tessellation unset.
@@ -1937,6 +1941,7 @@ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<R
         out.raster_sample_count = d.samples.max(1) as u32;
         out.input_primitive_topology = raw::<PrimitiveTopologyClass>(d.topology, "topology")?;
         out.rasterization_enabled = d.rasterization != 0;
+        out.support_indirect_command_buffers = d.indirect != 0;
         if d.vertex_inputs != 0 {
             let mut inputs = VertexDescriptor::new();
             for (i, a) in d.attributes.iter().enumerate() {
@@ -2809,6 +2814,300 @@ pub extern "C" fn nmb_encoder_use_heap(encoder: *mut NmbEncoder, heap: *const Nm
             NmbEncoder::Blit(_) => return Err("useHeap on a blit encoder".into()),
         }
         .map_err(e("use heap"))?;
+        Ok(true)
+    })
+}
+
+// ---- indirect command buffers ----
+
+/// `MTLIndirectCommandBuffer`: the runtime's records of its commands. The CPU writes a command through the setters below, which name
+/// it by index (`indirectRenderCommandAtIndex:` / `indirectComputeCommandAtIndex:` and the command's own setters); a shader writes it
+/// through an argument buffer the buffer is set in, once an encoder made it resident for writing. An encoder's
+/// `executeCommandsInBuffer:` runs the records as they stand when its work is submitted.
+pub struct NmbIndirectCommandBuffer(IndirectCommandBuffer);
+
+/// `MTLIndirectCommandBufferDescriptor`, its raw values. A count of `u64::MAX` leaves the runtime's default (Metal's).
+#[repr(C)]
+pub struct NmbIndirectCommandBufferDescriptor {
+    pub command_types: u64,
+    pub inherit_pipeline_state: u64,
+    pub inherit_buffers: u64,
+    pub max_vertex_buffers: u64,
+    pub max_fragment_buffers: u64,
+    pub max_kernel_buffers: u64,
+    pub max_kernel_threadgroup_memories: u64,
+    pub support_dynamic_attribute_stride: u64,
+    pub inherit_depth_stencil: u64,
+    pub inherit_depth_bias: u64,
+    pub inherit_depth_clip_mode: u64,
+    pub inherit_cull_mode: u64,
+    pub inherit_front_facing_winding: u64,
+    pub inherit_triangle_fill_mode: u64,
+}
+
+fn count32(value: u64, what: &str) -> Result<u32, String> {
+    u32::try_from(value).map_err(|_| format!("{what} {value} does not fit 32 bits"))
+}
+
+fn render_command(icb: *const NmbIndirectCommandBuffer, index: u64) -> Result<IndirectRenderCommand, String> {
+    get(icb)?.0.indirect_render_command_at(index).map_err(e("indirect render command"))
+}
+
+fn compute_command(icb: *const NmbIndirectCommandBuffer, index: u64) -> Result<IndirectComputeCommand, String> {
+    get(icb)?.0.indirect_compute_command_at(index).map_err(e("indirect compute command"))
+}
+
+/// `newIndirectCommandBufferWithDescriptor:maxCommandCount:options:`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_icb_new(device: *mut NmbDevice, descriptor: *const NmbIndirectCommandBufferDescriptor, max_count: u64,
+                              options_word: u64) -> *mut NmbIndirectCommandBuffer {
+    guard(std::ptr::null_mut(), || {
+        let d = get(descriptor)?;
+        let mut out = IndirectCommandBufferDescriptor::new();
+        out.command_types = raw::<IndirectCommandType>(d.command_types, "indirect command types")?;
+        out.inherit_pipeline_state = d.inherit_pipeline_state != 0;
+        out.inherit_buffers = d.inherit_buffers != 0;
+        out.max_vertex_buffer_bind_count = count32(d.max_vertex_buffers, "vertex buffer count")?;
+        out.max_fragment_buffer_bind_count = count32(d.max_fragment_buffers, "fragment buffer count")?;
+        out.max_kernel_buffer_bind_count = count32(d.max_kernel_buffers, "kernel buffer count")?;
+        if d.max_kernel_threadgroup_memories != u64::MAX {
+            out.max_kernel_threadgroup_memory_bind_count = count32(d.max_kernel_threadgroup_memories, "threadgroup memory count")?;
+        }
+        out.support_dynamic_attribute_stride = d.support_dynamic_attribute_stride != 0;
+        out.inherit_depth_stencil_state = d.inherit_depth_stencil != 0;
+        out.inherit_depth_bias = d.inherit_depth_bias != 0;
+        out.inherit_depth_clip_mode = d.inherit_depth_clip_mode != 0;
+        out.inherit_cull_mode = d.inherit_cull_mode != 0;
+        out.inherit_front_facing_winding = d.inherit_front_facing_winding != 0;
+        out.inherit_triangle_fill_mode = d.inherit_triangle_fill_mode != 0;
+        let icb = get(device)?.0.new_indirect_command_buffer(&out, max_count, options(options_word)?)
+            .map_err(e("indirect command buffer"))?;
+        Ok(boxed(NmbIndirectCommandBuffer(icb)))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_icb_release(icb: *mut NmbIndirectCommandBuffer) {
+    release(icb)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_icb_size(icb: *const NmbIndirectCommandBuffer) -> u64 {
+    guard(0, || Ok(get(icb)?.0.size()))
+}
+
+/// `gpuResourceID`: the word an argument buffer holds for the buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_icb_resource_id(icb: *const NmbIndirectCommandBuffer) -> u64 {
+    guard(0, || Ok(get(icb)?.0.gpu_resource_id().0))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_icb_allocated_size(icb: *const NmbIndirectCommandBuffer) -> u64 {
+    guard(0, || Ok(get(icb)?.0.allocated_size()))
+}
+
+/// `resetWithRange:`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_icb_reset(icb: *const NmbIndirectCommandBuffer, start: u64, count: u64) -> bool {
+    guard(false, || {
+        get(icb)?.0.reset_with_range(start..start.saturating_add(count)).map_err(e("indirect command buffer reset"))?;
+        Ok(true)
+    })
+}
+
+/// The command at `index` (`kind` 0 compute, else render): `reset`, and `setBarrier` (`barrier` 1) / `clearBarrier` (0).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_icb_command_reset(icb: *const NmbIndirectCommandBuffer, index: u64, kind: u32) -> bool {
+    guard(false, || {
+        if kind == COMPUTE { compute_command(icb, index)?.reset() } else { render_command(icb, index)?.reset() }
+            .map_err(e("indirect command reset"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_icb_command_barrier(icb: *const NmbIndirectCommandBuffer, index: u64, kind: u32, barrier: bool) -> bool {
+    guard(false, || {
+        match (kind == COMPUTE, barrier) {
+            (true, true) => compute_command(icb, index)?.set_barrier(),
+            (true, false) => compute_command(icb, index)?.clear_barrier(),
+            (false, true) => render_command(icb, index)?.set_barrier(),
+            (false, false) => render_command(icb, index)?.clear_barrier(),
+        }
+        .map_err(e("indirect command barrier"))?;
+        Ok(true)
+    })
+}
+
+/// A render command's `setRenderPipelineState:`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_icb_render_set_pipeline(icb: *const NmbIndirectCommandBuffer, index: u64, pipeline: *const NmbRenderPipeline) -> bool {
+    guard(false, || {
+        render_command(icb, index)?.set_render_pipeline_state(&get(pipeline)?.0)
+            .map_err(e("indirect render pipeline"))?;
+        Ok(true)
+    })
+}
+
+/// A command's buffer at `slot` of `stage` (0 kernel, 1 vertex, 2 fragment); a null buffer unsets it. `stride` `u64::MAX`: no attribute
+/// stride (`setVertexBuffer:offset:atIndex:`), else `setVertexBuffer:offset:attributeStride:atIndex:` (vertex and kernel buffers).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_icb_set_buffer(icb: *const NmbIndirectCommandBuffer, index: u64, stage: u32, buffer: *const NmbBuffer, offset: u64,
+                                     stride: u64, slot: u32) -> bool {
+    guard(false, || {
+        let buffer = optional(buffer)?.map(|b| &b.0);
+        match (stage, stride) {
+            (COMPUTE, u64::MAX) => compute_command(icb, index)?.set_kernel_buffer(buffer, offset, slot),
+            (COMPUTE, _) => compute_command(icb, index)?.set_kernel_buffer_with_stride(buffer, offset, stride, slot),
+            (VERTEX, u64::MAX) => render_command(icb, index)?.set_vertex_buffer(buffer, offset, slot),
+            (VERTEX, _) => render_command(icb, index)?.set_vertex_buffer_with_stride(buffer, offset, stride, slot),
+            (FRAGMENT, _) => render_command(icb, index)?.set_fragment_buffer(buffer, offset, slot),
+            _ => return Err(bad_stage(stage)),
+        }
+        .map_err(e("indirect command buffer binding"))?;
+        Ok(true)
+    })
+}
+
+/// A render command's `drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_icb_render_draw(icb: *const NmbIndirectCommandBuffer, index: u64, primitive: u64, start: u64, count: u64,
+                                      instances: u64, base_instance: u64) -> bool {
+    guard(false, || {
+        render_command(icb, index)?
+            .draw_primitives(raw::<PrimitiveType>(primitive, "primitive")?, start, count, instances, base_instance)
+            .map_err(e("indirect draw"))?;
+        Ok(true)
+    })
+}
+
+/// A render command's `drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nmb_icb_render_draw_indexed(icb: *const NmbIndirectCommandBuffer, index: u64, primitive: u64, count: u64,
+                                              index_type: u64, indices: *const NmbBuffer, offset: u64, instances: u64, base_vertex: i64,
+                                              base_instance: u64) -> bool {
+    guard(false, || {
+        render_command(icb, index)?
+            .draw_indexed_primitives(raw::<PrimitiveType>(primitive, "primitive")?, count, raw::<IndexType>(index_type, "index type")?,
+                                     &get(indices)?.0, offset, instances, base_vertex, base_instance)
+            .map_err(e("indirect indexed draw"))?;
+        Ok(true)
+    })
+}
+
+/// A compute command's `setComputePipelineState:`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_icb_compute_set_pipeline(icb: *const NmbIndirectCommandBuffer, index: u64, pipeline: *const NmbComputePipeline) -> bool {
+    guard(false, || {
+        compute_command(icb, index)?.set_compute_pipeline_state(&get(pipeline)?.0)
+            .map_err(e("indirect compute pipeline"))?;
+        Ok(true)
+    })
+}
+
+/// A compute command's `concurrentDispatchThreads:` (`threads`) or `concurrentDispatchThreadgroups:threadsPerThreadgroup:`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_icb_compute_dispatch(icb: *const NmbIndirectCommandBuffer, index: u64, grid: *const u64, per_group: *const u64,
+                                           threads: bool) -> bool {
+    guard(false, || {
+        let command = compute_command(icb, index)?;
+        let (grid, per_group) = (size(grid)?, size(per_group)?);
+        if threads { command.concurrent_dispatch_threads(grid, per_group) } else { command.concurrent_dispatch_threadgroups(grid, per_group) }
+            .map_err(e("indirect dispatch"))?;
+        Ok(true)
+    })
+}
+
+/// A compute command's `setThreadgroupMemoryLength:atIndex:`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_icb_compute_set_threadgroup_memory(icb: *const NmbIndirectCommandBuffer, index: u64, length: u32, slot: u32) -> bool {
+    guard(false, || {
+        compute_command(icb, index)?.set_threadgroup_memory_length(length, slot)
+            .map_err(e("indirect threadgroup memory"))?;
+        Ok(true)
+    })
+}
+
+/// `setIndirectCommandBuffer:atIndex:` of an argument encoder; a null buffer writes 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_set_icb(encoder: *const NmbArgumentEncoder, icb: *const NmbIndirectCommandBuffer, index: u32) -> bool {
+    guard(false, || {
+        get(encoder)?.0.set_indirect_command_buffer(optional(icb)?.map(|b| &b.0), index)
+            .map_err(e("argument encoder indirect command buffer"))?;
+        Ok(true)
+    })
+}
+
+/// `useResource:usage:(stages:)` of an indirect command buffer: one made resident for writing is a buffer the GPU may write.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_use_icb(encoder: *mut NmbEncoder, icb: *const NmbIndirectCommandBuffer, usage: u64, stages: u64) -> bool {
+    guard(false, || {
+        let resource = ResourceRef::IndirectCommandBuffer(&get(icb)?.0);
+        let usage = raw::<ResourceUsage>(usage, "resource usage")?;
+        match get_mut(encoder)? {
+            NmbEncoder::Compute(c) => c.use_resource(resource, usage),
+            NmbEncoder::Render(r) => r.use_resource(resource, usage, raw::<RenderStages>(stages, "render stages")?),
+            NmbEncoder::Blit(_) => return Err("useResource on a blit encoder".into()),
+        }
+        .map_err(e("use indirect command buffer"))?;
+        Ok(true)
+    })
+}
+
+/// `executeCommandsInBuffer:withRange:` (`range_buffer` null) or `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:` (the
+/// range read from `range_buffer` at `range_offset`), in a render or compute encoder.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_execute_icb(encoder: *mut NmbEncoder, icb: *const NmbIndirectCommandBuffer, start: u64, count: u64,
+                                          range_buffer: *const NmbBuffer, range_offset: u64) -> bool {
+    guard(false, || {
+        let icb = &get(icb)?.0;
+        let range = start..start.saturating_add(count);
+        let range_buffer = optional(range_buffer)?.map(|b| &b.0);
+        match (get_mut(encoder)?, range_buffer) {
+            (NmbEncoder::Render(r), None) => r.execute_commands_in_buffer(icb, range),
+            (NmbEncoder::Render(r), Some(b)) => r.execute_commands_in_buffer_indirect(icb, b, range_offset),
+            (NmbEncoder::Compute(c), None) => c.execute_commands_in_buffer(icb, range),
+            (NmbEncoder::Compute(c), Some(b)) => c.execute_commands_in_buffer_indirect(icb, b, range_offset),
+            (NmbEncoder::Blit(_), _) => return Err("executeCommandsInBuffer on a blit encoder".into()),
+        }
+        .map_err(e("execute indirect commands"))?;
+        Ok(true)
+    })
+}
+
+/// A blit encoder's `copyIndirectCommandBuffer:sourceRange:destination:destinationIndex:`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_blit_copy_icb(encoder: *mut NmbEncoder, source: *const NmbIndirectCommandBuffer, start: u64, count: u64,
+                                    destination: *const NmbIndirectCommandBuffer, destination_index: u64) -> bool {
+    guard(false, || {
+        blit(encoder)?.copy_indirect_command_buffer(&get(source)?.0, start..start.saturating_add(count), &get(destination)?.0,
+                                                    destination_index).map_err(e("copy indirect commands"))?;
+        Ok(true)
+    })
+}
+
+/// A blit encoder's `resetCommandsInBuffer:withRange:` (`optimize` false) or `optimizeIndirectCommandBuffer:withRange:`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_blit_reset_icb(encoder: *mut NmbEncoder, icb: *const NmbIndirectCommandBuffer, start: u64, count: u64, optimize: bool)
+                                     -> bool {
+    guard(false, || {
+        let (icb, range) = (&get(icb)?.0, start..start.saturating_add(count));
+        let blit = blit(encoder)?;
+        if optimize { blit.optimize_indirect_command_buffer(icb, range) } else { blit.reset_commands_in_buffer(icb, range) }
+            .map_err(e("reset indirect commands"))?;
+        Ok(true)
+    })
+}
+
+/// A render encoder's `memoryBarrierWithScope:afterStages:beforeStages:`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_memory_barrier(encoder: *mut NmbEncoder, scope: u64, after: u64, before: u64) -> bool {
+    guard(false, || {
+        let scope = raw::<BarrierScope>(scope, "barrier scope")?;
+        let (after, before) = (raw::<RenderStages>(after, "render stages")?, raw::<RenderStages>(before, "render stages")?);
+        render(encoder)?.memory_barrier_with_scope(scope, after, before);
         Ok(true)
     })
 }

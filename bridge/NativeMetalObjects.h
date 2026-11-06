@@ -229,6 +229,7 @@ struct NmbRenderPipelineDescriptor {
     /* vertexPreloadedLibraries / fragmentPreloadedLibraries: each stage's dynamic libraries, searched first, in order. */
     NmbDynamicLibrary *const *vertex_preloaded; uint64_t vertex_preloaded_count;
     NmbDynamicLibrary *const *fragment_preloaded; uint64_t fragment_preloaded_count;
+    uint64_t indirect; /* supportIndirectCommandBuffers: an indirect command may name the state */
 };
 NmbRenderPipeline *nmb_render_pipeline_new(NmbDevice *, const struct NmbRenderPipelineDescriptor *);
 /* Descriptor binaryArchives and MTLPipelineOption bits. NULL options means defaults.
@@ -317,6 +318,53 @@ bool nmb_encoder_update_fence(NmbEncoder *, NmbFence *, uint64_t stages);
 bool nmb_encoder_use_resource(NmbEncoder *, const NmbBuffer *, const NmbTexture *, uint64_t usage, uint64_t stages);
 bool nmb_encoder_use_heap(NmbEncoder *, const NmbHeap *, uint64_t stages);
 bool nmb_encoder_wait_fence(NmbEncoder *, NmbFence *, uint64_t stages);
+
+/* Indirect command buffers (MTLIndirectCommandBuffer): the runtime's records of the commands, which the CPU writes through the setters
+ * below (each names its command by index, as indirectRenderCommandAtIndex: / indirectComputeCommandAtIndex: and the command's setter), a
+ * shader through an argument buffer the buffer is set in once an encoder made it resident for writing, and an encoder's execution runs
+ * as they stand when its work is submitted. A count of UINT64_MAX leaves the runtime's default (Metal's). */
+typedef struct NmbIndirectCommandBuffer NmbIndirectCommandBuffer;
+struct NmbIndirectCommandBufferDescriptor {
+    uint64_t command_types, inherit_pipeline_state, inherit_buffers;
+    uint64_t max_vertex_buffers, max_fragment_buffers, max_kernel_buffers, max_kernel_threadgroup_memories;
+    uint64_t support_dynamic_attribute_stride;
+    /* the render states a command does not set: 1 draws with the executing encoder's (Metal's default) */
+    uint64_t inherit_depth_stencil, inherit_depth_bias, inherit_depth_clip_mode, inherit_cull_mode, inherit_front_facing_winding,
+        inherit_triangle_fill_mode;
+};
+NmbIndirectCommandBuffer *nmb_icb_new(NmbDevice *, const struct NmbIndirectCommandBufferDescriptor *, uint64_t max_count, uint64_t options);
+void nmb_icb_release(NmbIndirectCommandBuffer *);
+uint64_t nmb_icb_size(const NmbIndirectCommandBuffer *);
+uint64_t nmb_icb_resource_id(const NmbIndirectCommandBuffer *);
+uint64_t nmb_icb_allocated_size(const NmbIndirectCommandBuffer *);
+bool nmb_icb_reset(const NmbIndirectCommandBuffer *, uint64_t start, uint64_t count);
+/* kind: 0 a compute command, 1 a render command; barrier: setBarrier (true) / clearBarrier */
+bool nmb_icb_command_reset(const NmbIndirectCommandBuffer *, uint64_t index, uint32_t kind);
+bool nmb_icb_command_barrier(const NmbIndirectCommandBuffer *, uint64_t index, uint32_t kind, bool barrier);
+bool nmb_icb_render_set_pipeline(const NmbIndirectCommandBuffer *, uint64_t index, const NmbRenderPipeline *);
+/* stage: 0 kernel, 1 vertex, 2 fragment; NULL unsets the slot; stride UINT64_MAX: no attribute stride */
+bool nmb_icb_set_buffer(const NmbIndirectCommandBuffer *, uint64_t index, uint32_t stage, const NmbBuffer *, uint64_t offset, uint64_t stride,
+                        uint32_t slot);
+bool nmb_icb_render_draw(const NmbIndirectCommandBuffer *, uint64_t index, uint64_t primitive, uint64_t start, uint64_t count, uint64_t instances,
+                         uint64_t base_instance);
+bool nmb_icb_render_draw_indexed(const NmbIndirectCommandBuffer *, uint64_t index, uint64_t primitive, uint64_t count, uint64_t index_type,
+                                 const NmbBuffer *indices, uint64_t offset, uint64_t instances, int64_t base_vertex, uint64_t base_instance);
+bool nmb_icb_compute_set_pipeline(const NmbIndirectCommandBuffer *, uint64_t index, const NmbComputePipeline *);
+/* threads: concurrentDispatchThreads:, else concurrentDispatchThreadgroups:; both with threadsPerThreadgroup: */
+bool nmb_icb_compute_dispatch(const NmbIndirectCommandBuffer *, uint64_t index, const uint64_t grid[3], const uint64_t per_group[3], bool threads);
+bool nmb_icb_compute_set_threadgroup_memory(const NmbIndirectCommandBuffer *, uint64_t index, uint32_t length, uint32_t slot);
+bool nmb_argument_encoder_set_icb(const NmbArgumentEncoder *, const NmbIndirectCommandBuffer *, uint32_t index);
+/* useResource:usage:(stages:) of an indirect command buffer (made resident for writing: the GPU may write its commands) */
+bool nmb_encoder_use_icb(NmbEncoder *, const NmbIndirectCommandBuffer *, uint64_t usage, uint64_t stages);
+/* executeCommandsInBuffer:withRange: (range_buffer NULL) or executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:, render or compute */
+bool nmb_encoder_execute_icb(NmbEncoder *, const NmbIndirectCommandBuffer *, uint64_t start, uint64_t count, const NmbBuffer *range_buffer,
+                             uint64_t range_offset);
+bool nmb_blit_copy_icb(NmbEncoder *, const NmbIndirectCommandBuffer *source, uint64_t start, uint64_t count,
+                       const NmbIndirectCommandBuffer *destination, uint64_t destination_index);
+/* resetCommandsInBuffer:withRange: (optimize false) or optimizeIndirectCommandBuffer:withRange: */
+bool nmb_blit_reset_icb(NmbEncoder *, const NmbIndirectCommandBuffer *, uint64_t start, uint64_t count, bool optimize);
+/* memoryBarrierWithScope:afterStages:beforeStages: */
+bool nmb_render_memory_barrier(NmbEncoder *, uint64_t scope, uint64_t after, uint64_t before);
 
 NmbEncoder *nmb_compute_encoder_new(NmbCommandBuffer *);
 NmbEncoder *nmb_blit_encoder_new(NmbCommandBuffer *);

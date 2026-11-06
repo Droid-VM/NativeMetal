@@ -1851,6 +1851,113 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 - (void)dealloc {nmb_depth_stencil_release(_handle);}
 @end
 
+// ---- indirect command buffers ----
+// MTLIndirectCommandBuffer over the runtime's (nmb_icb_*): the CPU writes a command through indirectRenderCommandAtIndex: /
+// indirectComputeCommandAtIndex: and the command's setters, which write its record at once; a shader writes one through an argument
+// buffer the buffer is set in (setIndirectCommandBuffer:atIndex:), once an encoder made it resident for writing. An encoder's
+// executeCommandsInBuffer: runs the records as they stand when its work is submitted. WebKit's WebGPU encodes every render bundle into
+// one: without them each bundle was invalid ("MTLIndirectCommandBuffer allocation failed, likely tried to encode too many commands").
+@interface NBIndirectCommandBuffer : NBObject
+@property(nonatomic) NmbIndirectCommandBuffer *handle;
+@property(nonatomic) MTLResourceOptions options;
+@property(nonatomic,strong) id<MTLHeap> parentHeap;   // always nil: no heap makes one here
+@end
+static void icbRefused(const char *what) {
+ static std::atomic<int> told{0};
+ if(told.fetch_add(1)<64)NBLOG(@"native-metal: indirect command %s refused: %@",what,lastError());
+}
+// One command of an indirect command buffer, by its index (kind 0 compute, 1 render); its setters write the command's record at once.
+@interface NBIndirectCommand : NBObject
+@property(nonatomic,strong) NBIndirectCommandBuffer *buffer;
+@property(nonatomic) uint64_t index;
+@property(nonatomic) uint32_t kind;
+@end
+@implementation NBIndirectCommand
+- (void)buffer:(id<MTLBuffer>)b offset:(NSUInteger)o stride:(uint64_t)stride index:(NSUInteger)i stage:(uint32_t)stage what:(const char *)what {
+ if(b && ![(id)b isKindOfClass:[NBBuffer class]]){icbRefused(what);return;}
+ if(!nmb_icb_set_buffer(_buffer.handle,_index,stage,b?[(NBBuffer *)b handle]:nullptr,o,stride,(uint32_t)i))icbRefused(what);
+}
+- (void)reset {if(!nmb_icb_command_reset(_buffer.handle,_index,_kind))icbRefused("reset");}
+- (void)setBarrier {if(!nmb_icb_command_barrier(_buffer.handle,_index,_kind,true))icbRefused("setBarrier");}
+- (void)clearBarrier {if(!nmb_icb_command_barrier(_buffer.handle,_index,_kind,false))icbRefused("clearBarrier");}
+@end
+@interface NBIndirectRenderCommand : NBIndirectCommand
+@end
+@implementation NBIndirectRenderCommand
+- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)p {
+ if(![(id)p isKindOfClass:[NBRenderPipeline class]]){icbRefused("setRenderPipelineState (a foreign or nil state)");return;}
+ if(!nmb_icb_render_set_pipeline(self.buffer.handle,self.index,[(NBRenderPipeline *)p handle]))icbRefused("setRenderPipelineState");
+}
+- (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o stride:UINT64_MAX index:i stage:1 what:"setVertexBuffer"];}
+- (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o attributeStride:(NSUInteger)s atIndex:(NSUInteger)i {
+ [self buffer:b offset:o stride:s index:i stage:1 what:"setVertexBuffer:offset:attributeStride:atIndex:"];
+}
+- (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o stride:UINT64_MAX index:i stage:2 what:"setFragmentBuffer"];}
+- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)c baseInstance:(NSUInteger)b {
+ if(!nmb_icb_render_draw(self.buffer.handle,self.index,t,s,n,c,b))icbRefused("drawPrimitives");
+}
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
+                instanceCount:(NSUInteger)c baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi {
+ if(![(id)b isKindOfClass:[NBBuffer class]]){icbRefused("drawIndexedPrimitives (a foreign or nil index buffer)");return;}
+ if(!nmb_icb_render_draw_indexed(self.buffer.handle,self.index,t,n,k,[(NBBuffer *)b handle],o,c,v,bi))icbRefused("drawIndexedPrimitives");
+}
+// A command's own render states: only a device of Apple10 draws a command with them, and this one is not; Metal's process ends where a
+// command sets one (WebKit sets them on the render pass, whose state the commands inherit). Said once each kind, and dropped.
+- (void)renderState:(const char *)what {
+ static std::atomic<int> told{0};
+ if(told.fetch_add(1)<16)NBLOG(@"native-metal: indirect command %s dropped: commands draw with the encoder's state (not Apple10)",what);
+}
+- (void)setDepthStencilState:(id<MTLDepthStencilState>)s {(void)s;[self renderState:"setDepthStencilState"];}
+- (void)setCullMode:(MTLCullMode)m {(void)m;[self renderState:"setCullMode"];}
+- (void)setFrontFacingWinding:(MTLWinding)w {(void)w;[self renderState:"setFrontFacingWinding"];}
+- (void)setTriangleFillMode:(MTLTriangleFillMode)f {(void)f;[self renderState:"setTriangleFillMode"];}
+- (void)setDepthClipMode:(MTLDepthClipMode)m {(void)m;[self renderState:"setDepthClipMode"];}
+- (void)setDepthBias:(float)b slopeScale:(float)s clamp:(float)c {(void)b;(void)s;(void)c;[self renderState:"setDepthBias"];}
+@end
+@interface NBIndirectComputeCommand : NBIndirectCommand
+@end
+@implementation NBIndirectComputeCommand
+- (void)setComputePipelineState:(id<MTLComputePipelineState>)p {
+ if(![(id)p isKindOfClass:[NBComputePipeline class]]){icbRefused("setComputePipelineState (a foreign or nil state)");return;}
+ if(!nmb_icb_compute_set_pipeline(self.buffer.handle,self.index,[(NBComputePipeline *)p handle]))icbRefused("setComputePipelineState");
+}
+- (void)setKernelBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o stride:UINT64_MAX index:i stage:0 what:"setKernelBuffer"];}
+- (void)setKernelBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o attributeStride:(NSUInteger)s atIndex:(NSUInteger)i {
+ [self buffer:b offset:o stride:s index:i stage:0 what:"setKernelBuffer:offset:attributeStride:atIndex:"];
+}
+- (void)dispatch:(MTLSize)grid group:(MTLSize)group threads:(bool)threads {
+ const uint64_t g[3]={grid.width,grid.height,grid.depth},t[3]={group.width,group.height,group.depth};
+ if(!nmb_icb_compute_dispatch(self.buffer.handle,self.index,g,t,threads))icbRefused(threads?"concurrentDispatchThreads":"concurrentDispatchThreadgroups");
+}
+- (void)concurrentDispatchThreadgroups:(MTLSize)g threadsPerThreadgroup:(MTLSize)t {[self dispatch:g group:t threads:false];}
+- (void)concurrentDispatchThreads:(MTLSize)g threadsPerThreadgroup:(MTLSize)t {[self dispatch:g group:t threads:true];}
+- (void)setThreadgroupMemoryLength:(NSUInteger)n atIndex:(NSUInteger)i {
+ if(!nmb_icb_compute_set_threadgroup_memory(self.buffer.handle,self.index,(uint32_t)n,(uint32_t)i))icbRefused("setThreadgroupMemoryLength");
+}
+@end
+@implementation NBIndirectCommandBuffer
+- (void)dealloc {nmb_icb_release(_handle);}
+- (NSUInteger)size {return (NSUInteger)nmb_icb_size(_handle);}
+- (MTLResourceID)gpuResourceID {MTLResourceID id_;id_._impl=nmb_icb_resource_id(_handle);return id_;}
+- (id<MTLIndirectRenderCommand>)indirectRenderCommandAtIndex:(NSUInteger)i {
+ NBIndirectRenderCommand *command=[NBIndirectRenderCommand new];command.buffer=self;command.index=i;command.kind=1;
+ return (id<MTLIndirectRenderCommand>)command;
+}
+- (id<MTLIndirectComputeCommand>)indirectComputeCommandAtIndex:(NSUInteger)i {
+ NBIndirectComputeCommand *command=[NBIndirectComputeCommand new];command.buffer=self;command.index=i;command.kind=0;
+ return (id<MTLIndirectComputeCommand>)command;
+}
+- (void)resetWithRange:(NSRange)r {if(!nmb_icb_reset(_handle,r.location,r.length))icbRefused("resetWithRange");}
+- (MTLResourceOptions)resourceOptions {return _options;}
+- (MTLStorageMode)storageMode {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
+- (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
+- (MTLHazardTrackingMode)hazardTrackingMode {return (MTLHazardTrackingMode)((_options&MTLResourceHazardTrackingModeMask)>>MTLResourceHazardTrackingModeShift);}
+- (NSUInteger)allocatedSize {return (NSUInteger)nmb_icb_allocated_size(_handle);}
+- (NSUInteger)heapOffset {return 0;}
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {(void)state;return MTLPurgeableStateNonVolatile;}   // its records are never purged
+NB_RESOURCE_SPI
+@end
+
 // ---- argument encoders ----
 // MTLArgumentEncoder over the runtime's (nmb_argument_encoder_*): each argument is the 8 bytes a program could write itself (a buffer's
 // address plus the offset, any other object's gpuResourceID), written through the argument buffer's mapping at once, as Metal's encoder
@@ -1912,6 +2019,13 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 }
 - (void)setComputePipelineStates:(const id<MTLComputePipelineState> __unsafe_unretained [])p withRange:(NSRange)r {
  for(NSUInteger k=0;k<r.length;k++)[self setComputePipelineState:p[k] atIndex:r.location+k];
+}
+- (void)setIndirectCommandBuffer:(id<MTLIndirectCommandBuffer>)b atIndex:(NSUInteger)i {
+ if(b && ![(id)b isKindOfClass:[NBIndirectCommandBuffer class]]){[self foreign:"setIndirectCommandBuffer"];return;}
+ if(!nmb_argument_encoder_set_icb(_handle,b?[(NBIndirectCommandBuffer *)b handle]:nullptr,(uint32_t)i))[self refused:"setIndirectCommandBuffer"];
+}
+- (void)setIndirectCommandBuffers:(const id<MTLIndirectCommandBuffer> __unsafe_unretained [])b withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self setIndirectCommandBuffer:b[k] atIndex:r.location+k];
 }
 - (void *)constantDataAtIndex:(NSUInteger)i {
  void *at=nmb_argument_encoder_constant_data(_handle,(uint32_t)i);
@@ -2104,6 +2218,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 - (void)noteDraw;
 - (void)use:(id<MTLResource>)resource usage:(MTLResourceUsage)usage stages:(uint64_t)stages;
 - (void)useHeap:(id<MTLHeap>)heap stagesRaw:(uint64_t)stages;
+- (void)execute:(id<MTLIndirectCommandBuffer>)icb start:(NSUInteger)start count:(NSUInteger)count range:(id<MTLBuffer>)range offset:(NSUInteger)offset;
 @end
 // The runtime heap of a heap object (NBHeap is declared with the heaps, after the encoders); null for a foreign one.
 static NmbHeap *heapHandle(id heap);
@@ -2654,6 +2769,13 @@ static void writeDrawStats() {
 // an app's argument buffers), made resident by the runtime and kept alive with the command buffer as a bound one is.
 - (void)use:(id<MTLResource>)resource usage:(MTLResourceUsage)usage stages:(uint64_t)stages {
  if(!resource)return;
+ if([(id)resource isKindOfClass:[NBIndirectCommandBuffer class]]) {
+  // Made resident for writing, its commands are the GPU's to write (WebGPU's render bundles clamp indexed draws into them so).
+  [_commandBuffer.resourceOwners addObject:resource];
+  NmbIndirectCommandBuffer *icb=[(NBIndirectCommandBuffer *)resource handle];const uint64_t u=(uint64_t)usage;
+  ENCODE([self check:nmb_encoder_use_icb(self->_handle,icb,u,stages) what:"useResource (indirect command buffer)"]);
+  return;
+ }
  NmbBuffer *buffer=nullptr;NmbTexture *texture=nullptr;
  if([(id)resource isKindOfClass:[NBBuffer class]])buffer=[(NBBuffer *)resource handle];
  else if([(id)resource isKindOfClass:[NBTexture class]]) {
@@ -2666,6 +2788,16 @@ static void writeDrawStats() {
  [_commandBuffer.resourceOwners addObject:resource];
  const uint64_t u=(uint64_t)usage;
  ENCODE([self check:nmb_encoder_use_resource(self->_handle,buffer,texture,u,stages) what:"useResource"]);
+}
+// executeCommandsInBuffer:withRange: (range nil) or executeCommandsInBuffer:indirectBuffer:indirectBufferOffset: of a render or compute
+// encoder: the commands' records run as they stand when the command buffer's work is submitted.
+- (void)execute:(id<MTLIndirectCommandBuffer>)icb start:(NSUInteger)start count:(NSUInteger)count range:(id<MTLBuffer>)range offset:(NSUInteger)offset {
+ if(![(id)icb isKindOfClass:[NBIndirectCommandBuffer class]]){[_commandBuffer refuse:@"foreign indirect command buffer"];return;}
+ if(range && ![(id)range isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign indirect range buffer"];return;}
+ [_commandBuffer.resourceOwners addObject:icb];
+ if(range)[_commandBuffer.resourceOwners addObject:range];
+ NmbIndirectCommandBuffer *handle=[(NBIndirectCommandBuffer *)icb handle];NmbBuffer *rangeHandle=range?[(NBBuffer *)range handle]:nullptr;
+ ENCODE([self check:nmb_encoder_execute_icb(self->_handle,handle,start,count,rangeHandle,offset) what:"executeCommandsInBuffer"]);
 }
 - (void)useHeap:(id<MTLHeap>)heap stagesRaw:(uint64_t)stages {
  if(!heap)return;
@@ -2762,6 +2894,10 @@ static void writeDrawStats() {
 - (void)useHeap:(id<MTLHeap>)h {[self useHeap:h stagesRaw:0];}
 - (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)n {for(NSUInteger k=0;k<n;k++)[self useHeap:h[k] stagesRaw:0];}
 - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
+- (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)icb withRange:(NSRange)r {[self execute:icb start:r.location count:r.length range:nil offset:0];}
+- (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)icb indirectBuffer:(id<MTLBuffer>)b indirectBufferOffset:(NSUInteger)o {
+ [self execute:icb start:0 count:0 range:b offset:o];
+}
 @end
 
 @interface NBRenderEncoder : NBEncoder
@@ -3002,6 +3138,19 @@ static void writeDrawStats() {
 }
 - (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:true];}
 - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:false];}
+- (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)icb withRange:(NSRange)r {
+ gDraws++;self.commandBuffer->encodedWork.draws++;
+ [self execute:icb start:r.location count:r.length range:nil offset:0];
+}
+- (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)icb indirectBuffer:(id<MTLBuffer>)b indirectBufferOffset:(NSUInteger)o {
+ gDraws++;self.commandBuffer->encodedWork.draws++;
+ [self execute:icb start:0 count:0 range:b offset:o];
+}
+// WebGPU orders a draw's reads after the writes of the draws before it so (its indirect draws' clamped arguments, the indexed draws its
+// render bundles clamp into their indirect command buffers).
+- (void)memoryBarrierWithScope:(MTLBarrierScope)s afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b {
+ ENCODE([self check:nmb_render_memory_barrier(self.handle,s,a,b) what:"memoryBarrierWithScope:afterStages:beforeStages:"]);
+}
 @end
 
 @interface NBBlitEncoder : NBEncoder
@@ -3031,6 +3180,25 @@ static void writeDrawStats() {
 - (void)fillBuffer:(id<MTLBuffer>)b range:(NSRange)r value:(uint8_t)v {
  if(![self buffers:NB_OBJECTS(b) count:1])return;
  ENCODE([self check:nmb_blit_fill_buffer(self.handle,[(NBBuffer *)b handle],r.location,r.location+r.length,v) what:"fillBuffer"]);
+}
+// Indirect command buffers' commands, copied, reset and optimized as the command buffer runs (WebGPU trims a render bundle's so).
+- (bool)icbs:(__unsafe_unretained id *)objects count:(size_t)count {
+ for(size_t i=0;i<count;i++)if(![objects[i] isKindOfClass:[NBIndirectCommandBuffer class]]){[self.commandBuffer refuse:@"missing or foreign indirect command buffer"];return false;}
+ for(size_t i=0;i<count;i++)[self.commandBuffer.resourceOwners addObject:objects[i]];
+ return true;
+}
+- (void)copyIndirectCommandBuffer:(id<MTLIndirectCommandBuffer>)s sourceRange:(NSRange)r destination:(id<MTLIndirectCommandBuffer>)d destinationIndex:(NSUInteger)i {
+ if(![self icbs:NB_OBJECTS(s,d) count:2])return;
+ ENCODE([self check:nmb_blit_copy_icb(self.handle,[(NBIndirectCommandBuffer *)s handle],r.location,r.length,[(NBIndirectCommandBuffer *)d handle],i)
+         what:"copyIndirectCommandBuffer"]);
+}
+- (void)resetCommandsInBuffer:(id<MTLIndirectCommandBuffer>)b withRange:(NSRange)r {
+ if(![self icbs:NB_OBJECTS(b) count:1])return;
+ ENCODE([self check:nmb_blit_reset_icb(self.handle,[(NBIndirectCommandBuffer *)b handle],r.location,r.length,false) what:"resetCommandsInBuffer"]);
+}
+- (void)optimizeIndirectCommandBuffer:(id<MTLIndirectCommandBuffer>)b withRange:(NSRange)r {
+ if(![self icbs:NB_OBJECTS(b) count:1])return;
+ ENCODE([self check:nmb_blit_reset_icb(self.handle,[(NBIndirectCommandBuffer *)b handle],r.location,r.length,true) what:"optimizeIndirectCommandBuffer"]);
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
@@ -3899,7 +4067,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NBRenderDescriptor *
       (uint64_t)a.rgbBlendOperation,(uint64_t)a.sourceAlphaBlendFactor,(uint64_t)a.destinationAlphaBlendFactor,(uint64_t)a.alphaBlendOperation};
  }
  p->depth_format=d.depthAttachmentPixelFormat;p->stencil_format=d.stencilAttachmentPixelFormat;p->samples=d.rasterSampleCount;
- p->topology=d.inputPrimitiveTopology;p->rasterization=d.rasterizationEnabled;
+ p->topology=d.inputPrimitiveTopology;p->rasterization=d.rasterizationEnabled;p->indirect=d.supportIndirectCommandBuffers;
  if(MTLVertexDescriptor *v=d.vertexDescriptor) {
   for(unsigned i=0;i<31;i++) {
    MTLVertexAttributeDescriptor *a=v.attributes[i];if(a.format==MTLVertexFormatInvalid)continue;
@@ -4929,6 +5097,31 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
  if(!row)NBLOG(@"native-metal: requiredLinearTextureBytesPerRow: %@",lastError());
  return row;
 }
+// An MTLIndirectCommandBufferDescriptor property a target's header may not declare (the inherited render states are newer than its
+// SDK), or its default where the descriptor has none.
+static uint64_t icbCount(id d,const char *name,uint64_t fallback) {
+ SEL selector=sel_registerName(name);
+ return [d respondsToSelector:selector]?((NSUInteger (*)(id,SEL))objc_msgSend)(d,selector):fallback;
+}
+static uint64_t icbFlag(id d,const char *name,bool fallback) {
+ SEL selector=sel_registerName(name);
+ return [d respondsToSelector:selector]?((BOOL (*)(id,SEL))objc_msgSend)(d,selector)!=NO:fallback;
+}
+- (id<MTLIndirectCommandBuffer>)newIndirectCommandBufferWithDescriptor:(MTLIndirectCommandBufferDescriptor *)d maxCommandCount:(NSUInteger)count
+                                                               options:(MTLResourceOptions)options {
+ if(!d)return nil;
+ const NmbIndirectCommandBufferDescriptor r={(uint64_t)d.commandTypes,(uint64_t)d.inheritPipelineState,(uint64_t)d.inheritBuffers,
+     (uint64_t)d.maxVertexBufferBindCount,(uint64_t)d.maxFragmentBufferBindCount,(uint64_t)d.maxKernelBufferBindCount,
+     icbCount(d,"maxKernelThreadgroupMemoryBindCount",UINT64_MAX),icbFlag(d,"supportDynamicAttributeStride",false),
+     icbFlag(d,"inheritDepthStencilState",true),icbFlag(d,"inheritDepthBias",true),icbFlag(d,"inheritDepthClipMode",true),
+     icbFlag(d,"inheritCullMode",true),icbFlag(d,"inheritFrontFacingWinding",true),icbFlag(d,"inheritTriangleFillMode",true)};
+ NmbIndirectCommandBuffer *handle=nmb_icb_new(gDevice,&r,count,(uint64_t)options);
+ if(!handle) {
+  NBLOG(@"native-metal: indirect command buffer (types %#lx, %lu commands) refused: %@",(unsigned long)d.commandTypes,(unsigned long)count,lastError());
+  return nil;
+ }
+ NBIndirectCommandBuffer *icb=[NBIndirectCommandBuffer new];icb.handle=handle;icb.options=options;return (id<MTLIndirectCommandBuffer>)icb;
+}
 - (id<MTLArgumentEncoder>)newArgumentEncoderWithArguments:(NSArray<MTLArgumentDescriptor *> *)arguments {
  std::vector<NmbArgumentDescriptor> raw;raw.reserve(arguments.count);
  for(MTLArgumentDescriptor *a in arguments)
@@ -5086,7 +5279,9 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
    {"NBDepthStencil","MTLDepthStencilState"},{"NBEvent","MTLEvent"},{"NBSharedEvent","MTLSharedEvent"},{"NBFence","MTLFence"},
    {"NBQueue","MTLCommandQueue"},{"NBCommandBuffer","MTLCommandBuffer"},{"NBEncoder","MTLCommandEncoder"},
    {"NBComputeEncoder","MTLComputeCommandEncoder"},{"NBRenderEncoder","MTLRenderCommandEncoder"},{"NBBlitEncoder","MTLBlitCommandEncoder"},
-   {"NBHeap","MTLHeap"},{"NBBinaryArchive","MTLBinaryArchive"},{"NBArgumentEncoder","MTLArgumentEncoder"}};
+   {"NBHeap","MTLHeap"},{"NBBinaryArchive","MTLBinaryArchive"},{"NBArgumentEncoder","MTLArgumentEncoder"},
+   {"NBIndirectCommandBuffer","MTLIndirectCommandBuffer"},{"NBIndirectRenderCommand","MTLIndirectRenderCommand"},
+   {"NBIndirectComputeCommand","MTLIndirectComputeCommand"}};
   for(const auto &c:conformances){Class k=objc_getClass(c[0]);Protocol *pr=objc_getProtocol(c[1]);if(k&&pr)class_addProtocol(k,pr);}}
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];

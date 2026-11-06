@@ -588,7 +588,7 @@ static void noteWaitCaller(uint64_t lr,uint64_t lr2,uint64_t us) {
   if(seen==lr){gWaitCallers[i].n++;gWaitCallers[i].us+=us;return;}
  }
 }
-static std::mutex gCommitLock;
+static std::mutex &gCommitLock=*new std::mutex;   // never destroyed (see gAskedLock)
 // Command buffers committed in the last windowUs microseconds (at most the ring's 32): shader priming waits while the render server animates.
 extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs) {
  const uint64_t now=nowUs();unsigned n=0;
@@ -596,7 +596,7 @@ extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs) {
  for(const CommitRecord &r: gCommitRing)if(r.index && r.committedUs<=now && now-r.committedUs<=windowUs)n++;
  return n;
 }
-static std::mutex gProblemLock;
+static std::mutex &gProblemLock=*new std::mutex;   // never destroyed (see gAskedLock)
 static char gLastProblems[2][200];
 // The process's first problem, kept: a client process has no telemetry table, and its first refusal is usually the cause of the rest.
 static char gFirstProblem[200];
@@ -661,7 +661,15 @@ static bool logGpuOn() {static const bool on=getenv("SHENG_LOG_GPU")!=nullptr;re
 // the display shows the surfaces it composed last until backboardd restarts (the hang's evidence is in the host's KGSL log
 // and the context's loss mask, not here). End it once its completed handlers have seen the error; launchd starts it
 // again, SpringBoard with it, and the screen comes back at the lock screen. Other clients get AccessRevoked and decide.
-static bool isRenderServer() {static const bool renderServer=!strcmp(getprogname(),"backboardd");return renderServer;}
+// Whether this process is the system's compositor: the host says so (native_bridge_metal_set_render_server, from its server path
+// -- the iPadOS plugin's for backboardd, a macOS one's for WindowServer); until it does, the iPadOS render server's name.
+static std::atomic<int> gRenderServerSaid{-1};
+extern "C" void native_bridge_metal_set_render_server(bool on) {gRenderServerSaid=on?1:0;}
+static bool isRenderServer() {
+ const int said=gRenderServerSaid.load();
+ if(said>=0)return said;
+ static const bool named=!strcmp(getprogname(),"backboardd");return named;
+}
 static void endRenderServerAfterGpuLoss() {
  static std::atomic<bool> ending{false};
  if(!isRenderServer() || ending.exchange(true))return;
@@ -948,7 +956,7 @@ static NSString *lastError() {return [NSString stringWithUTF8String:nmb_last_err
 // The render pipeline journal: one line per render pipeline creation (when, on which thread, how long, the outcome, both functions with
 // every constant value, the attachments, blending and vertex descriptor) appended to pipelines.log in the runtime's cache directory, which
 // the board log exports with the caches (CacheExport.h): every pipeline a boot made, or was refused, can be made again on the host.
-static std::mutex gJournalLock;
+static std::mutex &gJournalLock=*new std::mutex;   // never destroyed (see gAskedLock)
 static std::string gJournalPath;
 static uint64_t gJournalBegan;
 static void journal(const std::string &line) {
@@ -1014,8 +1022,10 @@ static std::atomic<int64_t> gAskedBytes[3],gAskedCount[3];
 static void noteAsked(unsigned kind,int64_t bytes){if(!bytes)return;gAskedBytes[kind]+=bytes;gAskedCount[kind]+=bytes>0?1:-1;}
 // The counted textures and buffers themselves, for the largest of them (nmb_memory_top): bytes and what the texture is.
 struct AskedRecord {uint64_t bytes;NmbTextureDescriptor texture;bool isTexture;};
-static std::mutex gAskedLock;
-static std::unordered_map<const void *,AskedRecord> gAskedLive;
+// Never destroyed: an app's static destructors at exit() release Metal objects, whose tokens drop their records here after this
+// file's own statics have gone (GFXBench's ~RenderInfo locked the destroyed mutex: system_error, abort at exit).
+static std::mutex &gAskedLock=*new std::mutex;
+static std::unordered_map<const void *,AskedRecord> &gAskedLive=*new std::unordered_map<const void *,AskedRecord>;
 // Kept only while /private/var/ngpu/debug/client-mem exists when the process starts (the plugin's memory writer reads them).
 static const bool gKeepAsked=access("/private/var/ngpu/debug/client-mem",F_OK)==0;
 static void keepAsked(const void *object,const AskedRecord &record){
@@ -1101,7 +1111,7 @@ NB_RESOURCE_SPI
 // mapping, allocation identity or size needs a separate import; ordinary
 // caller-owned no-copy buffers do not enter this cache.
 static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
-static std::mutex gSurfaceImportLock;
+static std::mutex &gSurfaceImportLock=*new std::mutex;   // never destroyed (see gAskedLock)
 // Core Animation makes a texture of each window surface at every frame and drops it when the frame completes, so the weak table
 // lost the import between frames and each frame imported every surface again (allocate, map, free). As Metal keeps a surface's GPU
 // mapping for as long as the surface lives, an import stays held while anything else in this process still retains its surface (the
@@ -1459,7 +1469,7 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
 // Textures over host pages whose rows or offset are not whole 64-byte steps, which no linear image of this GPU lays out (fd6_layout: a
 // linear pitch of 64 bytes): the runtime keeps them as shadows and copies their bytes in. Count, bytes, and the largest one's size and
 // caller, for the telemetry's TB row.
-static std::mutex gUnalignedLock;
+static std::mutex &gUnalignedLock=*new std::mutex;   // never destroyed (see gAskedLock)
 static uint64_t gUnalignedCount,gUnalignedBytes,gUnalignedLargest,gUnalignedCaller;
 static uint32_t gUnalignedSize[3];
 static char gUnalignedImage[24];
@@ -2216,9 +2226,12 @@ static void dumpNote(NBCommandBuffer *commandBuffer,NSMutableArray *into,id text
 // the in-flight use of a resource -- first lets the thread catch up (encodeDrain). Other processes keep each call on the caller's
 // thread: where the runtime is nearly all a thread's work the split only adds its cost (GFXBench's Driver Overhead 2: 12% fewer frames
 // on 40% more CPU a frame). Switches read when a process starts: /private/var/ngpu/debug/encode-thread puts every process on one,
-// no-encode-thread none.
-static const bool gEncodeThread=access("/private/var/ngpu/debug/no-encode-thread",F_OK)!=0 &&
-                                (isRenderServer() || access("/private/var/ngpu/debug/encode-thread",F_OK)==0);
+// no-encode-thread none. Decided at the first call, after the host has said whether this is the render server.
+static bool encodeThreadOn() {
+ static const bool on=access("/private/var/ngpu/debug/no-encode-thread",F_OK)!=0 &&
+                      (isRenderServer() || access("/private/var/ngpu/debug/encode-thread",F_OK)==0);
+ return on;
+}
 // One thread of its own runs the work, in batches a calling thread hands over at 64 calls, at an encoder's end, at a commit and before a
 // wait: a dispatch queue took a call at a time and woke one of the pool's threads for each, a cost above a cheap call's own (GFXBench's
 // Driver Overhead 2 drew 16% fewer frames on 60% more CPU a frame), and spread the work over half a dozen threads.
@@ -2271,7 +2284,7 @@ struct EncodeThread {
 };
 static thread_local bool tOnEncodeThread;
 static thread_local EncodeBatch *tBatch;
-// In the render server (backboardd), and in any process while /private/var/ngpu/debug/encode-priority exists when it starts, the
+// In the render server (isRenderServer: backboardd on iPadOS), and in any process while /private/var/ngpu/debug/encode-priority exists, the
 // thread runs round-robin at a fixed priority (the file's number; 54, CoreAnimation's frame-info and completion threads', without
 // one) instead of the user-interactive QoS, which backboardd clamps to 37-46: below every app's and SpringBoard's main thread (47),
 // while CoreAnimation's display thread waits on it for each frame (render-server thread 55). As an app opened, those main threads
@@ -2280,17 +2293,19 @@ static thread_local EncodeBatch *tBatch;
 // 3.6 -> 10.8, apps' encode threads above their own main threads -- so by default only the render server's.
 // /private/var/ngpu/debug/no-encode-priority keeps the QoS everywhere. (Copying the first caller's pthread policy gave 31:
 // CoreAnimation's threads are not set through it.)
+// Decided as the thread is made (the first batch), after the host has said whether this is the render server.
 static bool encodePriorityWanted() {
  if(access("/private/var/ngpu/debug/no-encode-priority",F_OK)==0)return false;
- return access("/private/var/ngpu/debug/encode-priority",F_OK)==0 || strcmp(getprogname(),"backboardd")==0;
+ return access("/private/var/ngpu/debug/encode-priority",F_OK)==0 || isRenderServer();
 }
-static const bool gEncodePriority=encodePriorityWanted();
+static bool gEncodePriority;
 static int gEncodePolicy=SCHED_RR;static sched_param gEncodeParam={};
 static std::atomic<int> gEncodePriorityStatus{-1};
 static EncodeThread &encodeThread() {
  static EncodeThread *thread=[]{
   EncodeThread *t=new EncodeThread;
   pthread_t id;pthread_attr_t attr;pthread_attr_init(&attr);
+  gEncodePriority=encodePriorityWanted();
   if(gEncodePriority) {
    gEncodeParam.sched_priority=54;
    if(FILE *f=fopen("/private/var/ngpu/debug/encode-priority","r")){int p=0;if(fscanf(f,"%d",&p)==1 && p>0 && p<128)gEncodeParam.sched_priority=p;fclose(f);}
@@ -2324,7 +2339,7 @@ static void encodeFlush() {
 }
 // A closure takes what it uses by value (C arrays as std::array) or strongly (the objects whose handles it passes), as the call made it.
 template<class F> static void encodeLater(F &&work) {
- if(!gEncodeThread || onEncodeQueue()){work();return;}
+ if(!encodeThreadOn() || onEncodeQueue()){work();return;}
  if(!tBatch) {
   EncodeThread &t=encodeThread();
   {std::lock_guard<std::mutex> lock(t.lock);if(!t.spare.empty()){tBatch=t.spare.back();t.spare.pop_back();}}
@@ -2334,7 +2349,7 @@ template<class F> static void encodeLater(F &&work) {
  if(tBatch->count>=64)encodeFlush();
 }
 static void encodeDrain() {
- if(!gEncodeThread || onEncodeQueue())return;
+ if(!encodeThreadOn() || onEncodeQueue())return;
  encodeFlush();
  EncodeThread &t=encodeThread();
  std::unique_lock<std::mutex> lock(t.lock);
@@ -2362,7 +2377,7 @@ static uint64_t call(uint64_t ticket) {
 }
 static bool available() {
  static const bool ok=[]{
-  if(!gEncodeThread || !isRenderServer() || access("/private/var/ngpu/debug/no-display-hold",F_OK)==0)return false;
+  if(!encodeThreadOn() || !isRenderServer() || access("/private/var/ngpu/debug/no-display-hold",F_OK)==0)return false;
   void *iokit=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW|RTLD_LOCAL);if(!iokit)return false;
   auto matching=(CFMutableDictionaryRef (*)(const char *))dlsym(iokit,"IOServiceMatching");
   auto service=(unsigned (*)(unsigned,CFDictionaryRef))dlsym(iokit,"IOServiceGetMatchingService");
@@ -2397,7 +2412,7 @@ static void end(std::atomic<uint64_t> &ticket) {if(const uint64_t t=ticket.excha
 // The last commit that returned before its submission. The next one waits for it to be submitted: a frame's runtime work overlaps
 // the next frame's CoreAnimation work, and no more (without it the display thread went on a frame each refresh while the encoding
 // thread fell further behind).
-static std::mutex gDeferredLock;
+static std::mutex &gDeferredLock=*new std::mutex;   // never destroyed (see gAskedLock)
 static NBCommandBuffer *gDeferred;
 }
 // The GPU's IOSurface accesses, for the kernel (the board's DroidVMVirtioGpu3D.cpp, surfaceAccess): a command buffer that uses
@@ -2465,7 +2480,7 @@ static uint64_t begin(NSSet *surfaces,NSSet *written) {
 static void end(std::atomic<uint64_t> &ticket) {if(const uint64_t t=ticket.exchange(0))call(t,nullptr,0);}
 }
 // Held while a resource wait reads an in-flight command buffer's runtime handle and while a locally refused command buffer frees it.
-static std::mutex gRuntimeHandleLock;
+static std::mutex &gRuntimeHandleLock=*new std::mutex;   // never destroyed (see gAskedLock)
 static void waitForResource(id resource) {
  encodeDrain();   // every committed command buffer's uses recorded
  const uint64_t began=nowUs();
@@ -2491,7 +2506,7 @@ static void waitForResource(id resource) {
 // Which pipeline formats draw into which pass targets (telemetry DF rows): a pass key (colour 0 format, load action, a surface, a big target)
 // with the bound pipeline's colour 0 format, counted at each pipeline bind. A state format that is not its target's is the case plain Metal
 // stores with the target's byte order (BGRA8 exchanges bytes 0 and 2).
-static std::mutex gPassFormatLock;
+static std::mutex &gPassFormatLock=*new std::mutex;   // never destroyed (see gAskedLock)
 static struct {uint64_t key,n;} gPassFormatRows[32];
 static unsigned gPassFormatCount;
 static void noteFormats(uint64_t key) {
@@ -2674,7 +2689,7 @@ static void writeDrawStats() {
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
  if(dumpMaybe(_commandBuffer))[self dumpBind:[NSData dataWithBytes:bytes length:length] index:index stage:stage];
  if(gDrawStats)[self noteState:kDSBytes key:stage<<8|(uint32_t)index object:nullptr value:hashBytes(bytes,length)];
- if(!gEncodeThread){[self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];return;}
+ if(!encodeThreadOn()){[self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];return;}
  const std::vector<uint8_t> copy((const uint8_t *)bytes,(const uint8_t *)bytes+(bytes?length:0));   // the caller's bytes are its own again
  ENCODE([self check:nmb_encoder_set_bytes(self->_handle,stage,copy.empty()?nullptr:copy.data(),length,(uint32_t)index) what:"setBytes"]);
 }
@@ -5103,7 +5118,7 @@ static size_t native_bridge_metal_formats_locked(char *out,size_t size) {
  return n>0?(size_t)n:0;
 }
 // The benchmark's rows (native_bridge_metal_benchmark), kept for the telemetry table.
-static std::mutex gBenchLock;
+static std::mutex &gBenchLock=*new std::mutex;   // never destroyed (see gAskedLock)
 static char gBench[4][96];
 static std::atomic<unsigned> gBenchRuns;
 extern "C" size_t native_bridge_metal_benchmark(id device,const char *metallib,unsigned pairs,char *out,size_t size) {

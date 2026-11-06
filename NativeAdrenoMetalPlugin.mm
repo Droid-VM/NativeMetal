@@ -464,6 +464,9 @@ static id deviceForPort(unsigned port) {
         // With the memory writer (client-mem, below) the runtime keeps a report of its pools' blocks too (0031).
         if (access("/private/var/ngpu/debug/client-mem", F_OK) == 0) setenv("METAL2VULKAN_POOL_REPORT", "1", 1);
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
+        // From here the process is the render server: the frontend's policies for it (the encode thread's priority, ending it
+        // after a GPU loss) follow this, not the process's name.
+        native_bridge_metal_set_render_server(true);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
             if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);

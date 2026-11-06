@@ -32,5 +32,8 @@ bool native_bridge_metal_work_stats(uint64_t out[10]);
 size_t native_bridge_metal_benchmark(id device, const char *metallib, unsigned pairs, char *out, size_t size);
 // Lets go of every held IOSurface import whose surface only the import still retains (also done at each command buffer's completion).
 void native_bridge_metal_trim_surface_imports(void);
+// The host says this process is the system's compositor (its render server: the one CoreAnimation display thread that waits on
+// the encode thread for every frame), before its device is opened; until it does, a process named backboardd is one.
+void native_bridge_metal_set_render_server(bool on);
 }
 #endif

@@ -5427,10 +5427,10 @@ extern "C" size_t nmb_memory_row(char *out,size_t size) {
 extern "C" size_t nmb_split_row(char *out,size_t size) {
  if(!out || !size)return 0;
  out[0]=0;
- uint64_t c[12]={};
+ uint64_t c[13]={};
  if(!gDevice || !nmb_device_split_counts(gDevice,c))return 0;
- const int n=snprintf(out,size,"splits ins %llu inl %llu | bar %llu tile %llu tmem %llu att %llu fb %llu ml %llu pend %llu exec %llu vis %llu shape %llu\n",
-  (unsigned long long)c[0],(unsigned long long)c[11],(unsigned long long)c[1],(unsigned long long)c[2],(unsigned long long)c[3],
+ const int n=snprintf(out,size,"splits commits %llu ins %llu inl %llu | bar %llu (unneeded %llu) tile %llu tmem %llu att %llu fb %llu ml %llu pend %llu exec %llu vis %llu shape %llu\n",
+  (unsigned long long)gCommits.load(),(unsigned long long)c[0],(unsigned long long)c[11],(unsigned long long)c[1],(unsigned long long)c[12],(unsigned long long)c[2],(unsigned long long)c[3],
   (unsigned long long)c[4],(unsigned long long)c[5],(unsigned long long)c[6],(unsigned long long)c[7],(unsigned long long)c[8],
   (unsigned long long)c[9],(unsigned long long)c[10]);
  return n>0?(size_t)n:0;

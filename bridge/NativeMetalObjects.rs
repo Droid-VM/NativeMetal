@@ -765,22 +765,23 @@ pub extern "C" fn nmb_device_pass_counts(device: *const NmbDevice, out: *mut u64
     })
 }
 
-/// Render pass instances begun and why passes split into them, into the caller's twelve words: instances begun, then splits for a
+/// Render pass instances begun and why passes split into them, into the caller's thirteen words: instances begun, then splits for a
 /// barrier, a tile dispatch, tile memory, an attached read, a feedback loop, a memoryless write, a pending pipeline, an execution, a
-/// visibility mode and the shape, then passes begun inline.
+/// visibility mode and the shape, then passes begun inline, then memory barriers that ordered no write and split nothing.
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_device_split_counts(device: *const NmbDevice, out: *mut u64) -> bool {
     guard(false, || {
         if out.is_null() {
             return Err("null counts".into());
         }
-        // SAFETY: the caller's twelve words.
-        let out = unsafe { std::slice::from_raw_parts_mut(out, 12) };
+        // SAFETY: the caller's thirteen words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 13) };
         let w = get(device)?.0.work_counts();
         out.copy_from_slice(&[w.render_passes_begun_instances, w.instance_splits_barrier, w.instance_splits_tile_dispatch,
                               w.instance_splits_tile_memory, w.instance_splits_attached_read, w.instance_splits_feedback,
                               w.instance_splits_memoryless_write, w.instance_splits_pending_pipeline, w.instance_splits_execution,
-                              w.instance_splits_visibility, w.instance_splits_shape, w.render_passes_begun_inline]);
+                              w.instance_splits_visibility, w.instance_splits_shape, w.render_passes_begun_inline,
+                              w.unneeded_barriers]);
         Ok(true)
     })
 }

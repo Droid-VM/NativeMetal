@@ -55,8 +55,8 @@ bool nmb_device_texture_counts(const NmbDevice *, uint64_t out[8]);
 // Passes begun as instances, split inline; instance splits for a barrier, tile memory, a memoryless write, a pending pipeline; stand-ins
 // made and their bytes; stand-in copies made and those made at draws.
 bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
-// Render pass instances begun and why passes split into them (twelve words: begun, barrier, tile dispatch, tile memory, attached read,
-// feedback, memoryless write, pending pipeline, execution, visibility, shape, begun inline).
+// Render pass instances begun and why passes split into them (thirteen words: begun, barrier, tile dispatch, tile memory, attached read,
+// feedback, memoryless write, pending pipeline, execution, visibility, shape, begun inline, barriers that ordered no write).
 bool nmb_device_split_counts(const NmbDevice *, uint64_t *out);
 // Bytes of pooled blocks live and placed in them, empty kept, dedicated, host imports; bytes allocated so far; pooled and dedicated
 // blocks live; GPU pool blocks made and released.

@@ -55,6 +55,9 @@ bool nmb_device_texture_counts(const NmbDevice *, uint64_t out[8]);
 // Passes begun as instances, split inline; instance splits for a barrier, tile memory, a memoryless write, a pending pipeline; stand-ins
 // made and their bytes; stand-in copies made and those made at draws.
 bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
+// Render pass instances begun and why passes split into them (twelve words: begun, barrier, tile dispatch, tile memory, attached read,
+// feedback, memoryless write, pending pipeline, execution, visibility, shape, begun inline).
+bool nmb_device_split_counts(const NmbDevice *, uint64_t *out);
 // Bytes of pooled blocks live and placed in them, empty kept, dedicated, host imports; bytes allocated so far; pooled and dedicated
 // blocks live; GPU pool blocks made and released.
 bool nmb_device_memory_counts(const NmbDevice *, uint64_t out[10]);
@@ -66,6 +69,12 @@ size_t nmb_device_release_kept_memory(const NmbDevice *);
 // Call stacks that allocated device memory of 4 MiB or more, most bytes first: records of twelve words (bytes, allocations, ten return
 // addresses); returns how many were written, at most max.
 size_t nmb_allocation_sites(uint64_t *out, size_t max);
+// The bytes and blocks the bridge and the runtime hold of the system allocator (its counting global allocator): out[0], out[1].
+bool nmb_heap_counts(uint64_t *out);
+// Sampled heap sites (a diagnostic): turn them on; then the sites with live samples, most bytes first, as records of 14 words
+// (estimated live bytes, live samples, twelve return addresses innermost first); returns how many were written, at most max (64).
+void nmb_heap_sampling(void);
+size_t nmb_heap_sites(uint64_t *out, size_t max);
 // No-copy ranges checked, and those whose pages had changed since a buffer was last made over them (reported to the runtime as remapped).
 bool nmb_no_copy_remaps(uint64_t out[2]);
 bool nmb_device_scheduler_counts(const NmbDevice *, uint64_t out[16]);

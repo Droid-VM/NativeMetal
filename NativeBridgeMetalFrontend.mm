@@ -34,6 +34,7 @@
 #include <mach-o/loader.h>
 #include <execinfo.h>
 #include <mach/mach.h>
+#include <malloc/malloc.h>
 #include <thread>
 #include <fcntl.h>
 #include <unistd.h>
@@ -5410,10 +5411,28 @@ extern "C" size_t nmb_memory_row(char *out,size_t size) {
  static void (*cacheStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_darwin_bo_cache_stats"):nullptr;
  if(cacheStats)cacheStats(bc);
  auto mib=[](int64_t b){return (long long)(b>>20);};
- const int n=snprintf(out,size,"Ma t%lld/%lld b%lld/%lld h%lld|p%llu/%llu e%llu d%llu i%llu c%llu",
+ // The heap past the GPU's: the runtime's (its counting allocator), every malloc zone's in use, and the process's footprint.
+ uint64_t heap[2]={};nmb_heap_counts(heap);
+ malloc_statistics_t zones={};malloc_zone_statistics(nullptr,&zones);
+ task_vm_info_data_t vm={};mach_msg_type_number_t vmCount=TASK_VM_INFO_COUNT;
+ const uint64_t footprint=task_info(mach_task_self(),TASK_VM_INFO,(task_info_t)&vm,&vmCount)==KERN_SUCCESS?vm.phys_footprint:0;
+ const int n=snprintf(out,size,"Ma t%lld/%lld b%lld/%lld h%lld|p%llu/%llu e%llu d%llu i%llu c%llu|r%llu/%lluk z%llu f%llu",
   mib(gAskedBytes[0].load()),(long long)gAskedCount[0].load(),mib(gAskedBytes[1].load()),(long long)gAskedCount[1].load(),
   mib(gAskedBytes[2].load()),(unsigned long long)(mc[0]>>20),(unsigned long long)(mc[1]>>20),(unsigned long long)(mc[2]>>20),
-  (unsigned long long)(mc[3]>>20),(unsigned long long)(mc[4]>>20),(unsigned long long)(bc[5]>>20));
+  (unsigned long long)(mc[3]>>20),(unsigned long long)(mc[4]>>20),(unsigned long long)(bc[5]>>20),(unsigned long long)(heap[0]>>20),
+  (unsigned long long)(heap[1]>>10),(unsigned long long)(zones.size_in_use>>20),(unsigned long long)(footprint>>20));
+ return n>0?(size_t)n:0;
+}
+// The render pass instances this process's device began and why its passes split (the client memory file, startMemoryWriter).
+extern "C" size_t nmb_split_row(char *out,size_t size) {
+ if(!out || !size)return 0;
+ out[0]=0;
+ uint64_t c[12]={};
+ if(!gDevice || !nmb_device_split_counts(gDevice,c))return 0;
+ const int n=snprintf(out,size,"splits ins %llu inl %llu | bar %llu tile %llu tmem %llu att %llu fb %llu ml %llu pend %llu exec %llu vis %llu shape %llu\n",
+  (unsigned long long)c[0],(unsigned long long)c[11],(unsigned long long)c[1],(unsigned long long)c[2],(unsigned long long)c[3],
+  (unsigned long long)c[4],(unsigned long long)c[5],(unsigned long long)c[6],(unsigned long long)c[7],(unsigned long long)c[8],
+  (unsigned long long)c[9],(unsigned long long)c[10]);
  return n>0?(size_t)n:0;
 }
 // The `count` largest counted textures and buffers, one line each: MiB (two decimals), then a texture's size, format, levels, samples,

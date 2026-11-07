@@ -38,6 +38,352 @@ thread_local! {
     static LAST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
+/// The system allocator, counting the bytes and blocks it holds for the bridge and the runtime (nmb_heap_counts): what of a process's
+/// malloc'd memory is the runtime's, against Turnip's, the frontend's and the system's.
+struct CountedSystem;
+
+static HEAP_BYTES: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static HEAP_BLOCKS: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+fn heap_add(bytes: isize, blocks: isize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    HEAP_BYTES.fetch_add(bytes, Relaxed);
+    HEAP_BLOCKS.fetch_add(blocks, Relaxed);
+}
+
+// SAFETY: each call is the system allocator's own; the counts and the samples change only for what it did, and a free's sample goes
+// before the block does (another thread's allocation of the same address samples after it).
+unsafe impl std::alloc::GlobalAlloc for CountedSystem {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let ptr = unsafe { std::alloc::System.alloc(layout) };
+        if !ptr.is_null() {
+            heap_add(layout.size() as isize, 1);
+            heap_sites::allocated(ptr, layout.size());
+        }
+        ptr
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let ptr = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            heap_add(layout.size() as isize, 1);
+            heap_sites::allocated(ptr, layout.size());
+        }
+        ptr
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        heap_sites::freed(ptr);
+        unsafe { std::alloc::System.dealloc(ptr, layout) };
+        heap_add(-(layout.size() as isize), -1);
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        heap_sites::freed(ptr);
+        let moved = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+        if !moved.is_null() {
+            heap_add(new_size as isize - layout.size() as isize, 0);
+            heap_sites::allocated(moved, new_size);
+        }
+        moved
+    }
+}
+
+/// Sampled heap sites (nmb_heap_sampling, nmb_heap_sites), a diagnostic the client memory file turns on: once on, about one allocation
+/// in each INTERVAL bytes a thread allocates keeps its call stack (the frame-pointer chain) and stands for INTERVAL bytes (or its own
+/// size, if larger) until it is freed, so a site's live samples estimate what that call stack holds. Nothing here allocates: fixed
+/// tables under a spin lock, and a bitmap of the sampled addresses that lets every other free pass without the lock.
+mod heap_sites {
+    use std::cell::{Cell, UnsafeCell};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::{Acquire, Relaxed, Release}};
+
+    pub const INTERVAL: usize = 32 << 10;
+    pub const FRAMES: usize = 12;
+    const SLOTS: usize = 1 << 16;
+    const SITES: usize = 1 << 12;
+    const BITS: usize = 1 << 21;
+    const EMPTY: usize = 0;
+    const GONE: usize = usize::MAX;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    /// Whether a sample was ever kept: frees look at the bitmap only then.
+    static KEPT: AtomicBool = AtomicBool::new(false);
+    static LOCK: AtomicBool = AtomicBool::new(false);
+    /// Which of the two tables and bitmaps is current (a rebuild fills the other one, then flips this).
+    static CURRENT: AtomicUsize = AtomicUsize::new(0);
+    static MAPS: [[AtomicU64; BITS / 64]; 2] = [const { [const { AtomicU64::new(0) }; BITS / 64] }; 2];
+
+    #[derive(Clone, Copy)]
+    struct Slot {
+        ptr: usize,
+        site: u32,
+        weight: u32,
+    }
+    #[derive(Clone, Copy)]
+    pub struct Site {
+        pub hash: u64,
+        pub frames: [usize; FRAMES],
+        pub bytes: u64,
+        pub count: u64,
+    }
+    struct Tables {
+        slots: [[Slot; SLOTS]; 2],
+        /// Live samples and tombstones in the current slots.
+        live: usize,
+        gone: usize,
+        sites: [Site; SITES],
+    }
+    struct Shared(UnsafeCell<Tables>);
+    // SAFETY: only reached under LOCK.
+    unsafe impl Sync for Shared {}
+    const NO_SLOT: Slot = Slot { ptr: EMPTY, site: 0, weight: 0 };
+    const NO_SITE: Site = Site { hash: 0, frames: [0; FRAMES], bytes: 0, count: 0 };
+    static TABLES: Shared = Shared(UnsafeCell::new(Tables {
+        slots: [[NO_SLOT; SLOTS]; 2],
+        live: 0,
+        gone: 0,
+        sites: [NO_SITE; SITES],
+    }));
+
+    thread_local! {
+        static UNTIL: Cell<usize> = const { Cell::new(INTERVAL) };
+    }
+
+    pub fn turn_on() {
+        ON.store(true, Relaxed);
+    }
+
+    fn mix(value: usize) -> usize {
+        let x = (value as u64 ^ (value as u64 >> 29)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        (x ^ (x >> 32)) as usize
+    }
+
+    fn with_tables<R>(f: impl FnOnce(&mut Tables) -> R) -> R {
+        while LOCK.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
+            std::hint::spin_loop();
+        }
+        // SAFETY: LOCK is held.
+        let r = f(unsafe { &mut *TABLES.0.get() });
+        LOCK.store(false, Release);
+        r
+    }
+
+    /// The return addresses of the frame-pointer chain above the allocator's frames, their pointer authentication codes stripped.
+    #[inline(never)]
+    fn walk() -> [usize; FRAMES] {
+        let mut out = [0; FRAMES];
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut fp: usize;
+            // SAFETY: reads this thread's frame pointer register.
+            unsafe { std::arch::asm!("mov {}, x29", out(reg) fp) };
+            let (mut at, mut skip) = (0, 2);
+            while fp != 0 && fp & 7 == 0 && at < FRAMES {
+                // SAFETY: a frame record of this thread's stack: the chain rises within it.
+                let (next, ret) = unsafe { (*(fp as *const usize), *((fp + 8) as *const usize)) };
+                if skip > 0 {
+                    skip -= 1;
+                } else {
+                    out[at] = ret & 0x0000_007f_ffff_ffff;
+                    at += 1;
+                }
+                if next <= fp || next - fp > 1 << 20 {
+                    break;
+                }
+                fp = next;
+            }
+        }
+        out
+    }
+
+    pub fn allocated(ptr: *mut u8, size: usize) {
+        if !ON.load(Relaxed) {
+            return;
+        }
+        let take = UNTIL.with(|until| {
+            let left = until.get();
+            let take = size >= left;
+            until.set(if take { INTERVAL } else { left - size });
+            take
+        });
+        if take {
+            keep(ptr as usize, size);
+        }
+    }
+
+    fn keep(ptr: usize, size: usize) {
+        let frames = walk();
+        let hash = frames.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &f| (h ^ f as u64).wrapping_mul(0x100_0000_01b3)) | 1;
+        let weight = size.max(INTERVAL).min(u32::MAX as usize) as u32;
+        with_tables(|t| {
+            if (t.live + t.gone) * 2 > SLOTS {
+                rebuild(t);
+            }
+            if t.live * 2 > SLOTS {
+                return;
+            }
+            // Its site (the last one stands for every stack past the table).
+            let mut site = (hash as usize) % (SITES - 1);
+            for _ in 0..SITES - 1 {
+                let s = &mut t.sites[site];
+                if s.hash == hash || s.hash == 0 {
+                    break;
+                }
+                site = (site + 1) % (SITES - 1);
+            }
+            if t.sites[site].hash != hash && t.sites[site].hash != 0 {
+                site = SITES - 1;
+            }
+            if t.sites[site].hash == 0 {
+                t.sites[site].hash = hash;
+                t.sites[site].frames = frames;
+            }
+            t.sites[site].bytes += weight as u64;
+            t.sites[site].count += 1;
+            let current = CURRENT.load(Relaxed);
+            let slots = &mut t.slots[current];
+            let mut at = mix(ptr) % SLOTS;
+            while slots[at].ptr != EMPTY && slots[at].ptr != GONE {
+                at = (at + 1) % SLOTS;
+            }
+            if slots[at].ptr == GONE {
+                t.gone -= 1;
+            }
+            slots[at] = Slot { ptr, site: site as u32, weight };
+            t.live += 1;
+            let bit = mix(ptr) % BITS;
+            MAPS[current][bit / 64].fetch_or(1 << (bit % 64), Relaxed);
+        });
+        KEPT.store(true, Release);
+    }
+
+    /// Move the live samples into the other table and bitmap, dropping the tombstones.
+    fn rebuild(t: &mut Tables) {
+        let from = CURRENT.load(Relaxed);
+        let to = 1 - from;
+        for word in &MAPS[to] {
+            word.store(0, Relaxed);
+        }
+        // (in place: the table is too large for an allocating thread's stack)
+        for slot in t.slots[to].iter_mut() {
+            *slot = NO_SLOT;
+        }
+        for i in 0..SLOTS {
+            let slot = t.slots[from][i];
+            if slot.ptr == EMPTY || slot.ptr == GONE {
+                continue;
+            }
+            let mut at = mix(slot.ptr) % SLOTS;
+            while t.slots[to][at].ptr != EMPTY {
+                at = (at + 1) % SLOTS;
+            }
+            t.slots[to][at] = slot;
+            let bit = mix(slot.ptr) % BITS;
+            MAPS[to][bit / 64].fetch_or(1 << (bit % 64), Relaxed);
+        }
+        t.gone = 0;
+        CURRENT.store(to, Release);
+    }
+
+    pub fn freed(ptr: *mut u8) {
+        if !KEPT.load(Relaxed) || ptr.is_null() {
+            return;
+        }
+        let ptr = ptr as usize;
+        let bit = mix(ptr) % BITS;
+        let current = CURRENT.load(Acquire);
+        if MAPS[current][bit / 64].load(Relaxed) & (1 << (bit % 64)) == 0
+            && MAPS[1 - current][bit / 64].load(Relaxed) & (1 << (bit % 64)) == 0
+        {
+            return;
+        }
+        with_tables(|t| {
+            let slots = &mut t.slots[CURRENT.load(Relaxed)];
+            let mut at = mix(ptr) % SLOTS;
+            for _ in 0..SLOTS {
+                match slots[at].ptr {
+                    EMPTY => return,
+                    p if p == ptr => {
+                        let slot = slots[at];
+                        slots[at].ptr = GONE;
+                        t.live -= 1;
+                        t.gone += 1;
+                        let site = &mut t.sites[slot.site as usize];
+                        site.bytes -= slot.weight as u64;
+                        site.count -= 1;
+                        return;
+                    }
+                    _ => at = (at + 1) % SLOTS,
+                }
+            }
+        });
+    }
+
+    /// The sites with live samples, most bytes first, into `out`; how many.
+    pub fn sites(out: &mut [Site]) -> usize {
+        let mut top = [NO_SITE; 64];
+        let mut n = 0;
+        with_tables(|t| {
+            for site in t.sites.iter().filter(|s| s.count > 0) {
+                if n < top.len() {
+                    top[n] = *site;
+                    n += 1;
+                } else if let Some(least) = (0..n).min_by_key(|&i| top[i].bytes) {
+                    if top[least].bytes < site.bytes {
+                        top[least] = *site;
+                    }
+                }
+            }
+        });
+        top[..n].sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        let count = n.min(out.len());
+        out[..count].copy_from_slice(&top[..count]);
+        count
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountedSystem = CountedSystem;
+
+/// Turn the sampled heap sites on (the client memory file; nothing turns them off).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_heap_sampling() {
+    heap_sites::turn_on();
+}
+
+/// The sampled heap sites with live samples, most bytes first, into the caller's `max` records of 2 + 12 words: estimated live bytes,
+/// live samples, then twelve return addresses (0 past the stack's end), innermost first. Returns the records written.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_heap_sites(out: *mut u64, max: usize) -> usize {
+    if out.is_null() {
+        return 0;
+    }
+    let mut sites = [heap_sites::Site { hash: 0, frames: [0; heap_sites::FRAMES], bytes: 0, count: 0 }; 64];
+    let n = heap_sites::sites(&mut sites).min(max);
+    const WORDS: usize = 2 + heap_sites::FRAMES;
+    // SAFETY: the caller's `max` records.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, n * WORDS) };
+    for (record, site) in out.chunks_mut(WORDS).zip(&sites[..n]) {
+        record[0] = site.bytes;
+        record[1] = site.count;
+        for (word, frame) in record[2..].iter_mut().zip(site.frames) {
+            *word = frame as u64;
+        }
+    }
+    n
+}
+
+/// The bytes and blocks the bridge and the runtime hold of the system allocator, into the caller's two words.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_heap_counts(out: *mut u64) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    // SAFETY: the caller's two words.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, 2) };
+    out[0] = HEAP_BYTES.load(Relaxed).max(0) as u64;
+    out[1] = HEAP_BLOCKS.load(Relaxed).max(0) as u64;
+    true
+}
+
 fn set_error(why: String) {
     LAST.with(|last| {
         let mut last = last.borrow_mut();
@@ -415,6 +761,26 @@ pub extern "C" fn nmb_device_pass_counts(device: *const NmbDevice, out: *mut u64
         out.copy_from_slice(&[w.render_passes_begun_instances, w.inline_passes_split, w.instance_splits_barrier,
                               w.instance_splits_tile_memory, w.instance_splits_memoryless_write, w.instance_splits_pending_pipeline,
                               w.stand_ins_made, w.stand_in_bytes, w.stand_in_copies_made, w.stand_in_copies_made_at_draws]);
+        Ok(true)
+    })
+}
+
+/// Render pass instances begun and why passes split into them, into the caller's twelve words: instances begun, then splits for a
+/// barrier, a tile dispatch, tile memory, an attached read, a feedback loop, a memoryless write, a pending pipeline, an execution, a
+/// visibility mode and the shape, then passes begun inline.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_split_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the caller's twelve words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 12) };
+        let w = get(device)?.0.work_counts();
+        out.copy_from_slice(&[w.render_passes_begun_instances, w.instance_splits_barrier, w.instance_splits_tile_dispatch,
+                              w.instance_splits_tile_memory, w.instance_splits_attached_read, w.instance_splits_feedback,
+                              w.instance_splits_memoryless_write, w.instance_splits_pending_pipeline, w.instance_splits_execution,
+                              w.instance_splits_visibility, w.instance_splits_shape, w.render_passes_begun_inline]);
         Ok(true)
     })
 }

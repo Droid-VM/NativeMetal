@@ -263,10 +263,33 @@ static void startPassReporter(unsigned port) {
 // kernel's per-client text rows hold 8 processes, and a wallpaper extension came after them.
 extern "C" size_t nmb_memory_row(char *out, size_t size) __attribute__((weak));
 extern "C" size_t nmb_memory_top(char *out, size_t size, unsigned count) __attribute__((weak));
+extern "C" size_t nmb_split_row(char *out, size_t size) __attribute__((weak));
 // The runtime's live placements by the source line that asked for them (the board's patches/metal2vulkan/0028).
 extern "C" size_t m2v_placement_sites(uint8_t *out, size_t size) __attribute__((weak));
 // Its pools' blocks: size, used, free ranges, longest free range (0031).
 extern "C" size_t m2v_pool_report(uint8_t *out, size_t size) __attribute__((weak));
+// The bridge's sampled heap sites (its counting allocator): turned on here, then "heap MiB samples frames" lines, a frame +offset in
+// the plugin (its link map names it) or *offset in another image.
+extern "C" void nmb_heap_sampling(void) __attribute__((weak));
+extern "C" size_t nmb_heap_sites(uint64_t *out, size_t max) __attribute__((weak));
+static void writeHeapSites(FILE *file) {
+    if (!&nmb_heap_sites) return;
+    static uint64_t sites[64 * 14];
+    const size_t n = nmb_heap_sites(sites, 64);
+    static Dl_info self = {};
+    static const bool selfFound = dladdr((const void *)&nmb_heap_sites, &self);
+    for (size_t i = 0; i < n; ++i) {
+        const uint64_t *site = sites + i * 14;
+        fprintf(file, "heap %.2f %llu", site[0] / 1048576.0, (unsigned long long)site[1]);
+        for (unsigned f = 0; f < 12 && site[2 + f]; ++f) {
+            Dl_info info = {};
+            const bool found = dladdr((const void *)site[2 + f], &info) && info.dli_fbase;
+            const bool mine = found && selfFound && info.dli_fbase == self.dli_fbase;
+            fprintf(file, " %c%llx", mine ? '+' : '*', (unsigned long long)(found ? site[2 + f] - (uint64_t)info.dli_fbase : site[2 + f]));
+        }
+        fputc('\n', file);
+    }
+}
 static void startMemoryWriter() {
     if (!&nmb_memory_row || access("/private/var/ngpu/debug/client-mem", F_OK) != 0) return;
     static std::atomic<bool> started{false};
@@ -274,6 +297,7 @@ static void startMemoryWriter() {
     char dir[512];
     if (!confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir - 32)) return;
     std::string path = std::string(dir) + "m2v-mem.txt", partial = path + ".new";
+    if (&nmb_heap_sampling) nmb_heap_sampling();
     std::thread([path, partial]{
         pthread_setname_np("memory-writer");
         for (;;) {
@@ -287,6 +311,8 @@ static void startMemoryWriter() {
                     // Then where the runtime's own placements came from (shadows, twins, staging): "site MiB count file:line".
                     if (&m2v_placement_sites && m2v_placement_sites(reinterpret_cast<uint8_t *>(top), sizeof top)) fputs(top, file);
                     if (&m2v_pool_report && m2v_pool_report(reinterpret_cast<uint8_t *>(top), sizeof top)) fputs(top, file);
+                    if (&nmb_split_row && nmb_split_row(top, sizeof top)) fputs(top, file);
+                    writeHeapSites(file);
                     fclose(file);
                     rename(partial.c_str(), path.c_str());
                 }

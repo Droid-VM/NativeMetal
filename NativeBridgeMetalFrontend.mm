@@ -2093,7 +2093,13 @@ static void notified(void *context,uint64_t value) {
 @end
 
 // ---- command buffers and encoders ----
-@interface NBQueue : NBObject
+@interface NBQueue : NBObject {
+@public
+ // Its committed command buffers that have not completed, in commit order (schedpace): the ones a command buffer's scheduling
+ // waits behind. A command buffer is listed from its commit to its completion, which removes it.
+ std::mutex paceLock;
+ std::deque<void *> paceList;
+}
 @property(nonatomic) NmbQueue *handle;
 @property(atomic,strong) dispatch_queue_t completionQueue;   // SPI: where command buffers' handlers run (nil: the runtime's thread)
 @end
@@ -2174,6 +2180,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
  BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
  std::vector<WatchedSource> watched;
  std::atomic<uint64_t> holdTicket;   // the display hold its commit took (displayhold), ended once the runtime has submitted it
+ bool paceListed,paceHeld;   // in its queue's paceList; submitted, its scheduling held back (schedpace), under the queue's paceLock
  std::atomic<uint64_t> surfaceTicket;   // the kernel's record of the IOSurfaces it uses (surfacesync), ended at its completion
 }
 @property(nonatomic) NmbCommandBuffer *handle;
@@ -2203,6 +2210,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic) BOOL dumpReadback;
 @property(nonatomic,strong) NSMutableArray<NSString *> *dumpLog;   // its passes and first draws, as encoded (NBEncoder dumpDraw:)
 - (void)refuse:(NSString *)what;
+- (void)deliverScheduled;
 @end
 @interface NBEncoder : NBObject
 @property(nonatomic) NmbEncoder *handle;
@@ -2542,11 +2550,12 @@ static displayhold::CallFn gCall;
 static unsigned gConnection,gSelector=256;
 struct Record {uint32_t surface,written;};
 enum {kRecordsPerCall=256};
-// Begins a ticket (0), adds the records to one, or with none ends it; the ticket, 0 when refused.
-static uint64_t call(uint64_t ticket,const Record *records,uint32_t count) {
+// Begins a ticket (0), adds the records to one, or with none ends it; the ticket, 0 when refused. `ask` (the kernel's pad word):
+// 1 waits for the writers of the ticket's read surfaces instead (awaitWriters), 2 asks whether the kernel does.
+static uint64_t call(uint64_t ticket,const Record *records,uint32_t count,uint32_t ask=0) {
  struct {uint32_t magic,method;uint64_t ticket;uint32_t count,pad;Record records[kRecordsPerCall];} in;
  in.magic=0x4e544e4cu;in.method=0x7200+11;   // the tunnel's magic and the method (DROIDVM_VIRTGPU_METHOD + the surface op)
- in.ticket=ticket;in.count=count;in.pad=0;
+ in.ticket=ticket;in.count=count;in.pad=ask;
  if(count)memcpy(in.records,records,count*sizeof(Record));
  uint64_t out=0;size_t size=sizeof out;
  return gCall(gConnection,gSelector,&in,sizeof in-sizeof in.records+count*sizeof(Record),&out,&size)==0?out:0;
@@ -2594,6 +2603,26 @@ static uint64_t begin(NSSet *surfaces,NSSet *written) {
  return ticket;
 }
 static void end(std::atomic<uint64_t> &ticket) {if(const uint64_t t=ticket.exchange(0))call(t,nullptr,0);}
+// The render server's command buffers wait, before they are submitted, for the GPU work of other processes begun before them that
+// writes a surface they read (the kernel's awaitWriters, at most 100 ms): the guest's GPU contexts run on the host's KGSL rings,
+// which do not order one context's work after another's, and the render server's ring is ahead of the apps' (DRM2KGSL_PRIORITIES),
+// so its composition could run before an app's drawing queued earlier, where Apple's GPU orders a read of an IOSurface after the
+// writes queued before it. WebKit hands CoreAnimation a canvas's surface once its drawing is scheduled, not done. On the encoding
+// thread, so the display thread goes on with the next frame. A kernel without the wait answers the question with a ticket of no
+// surfaces, which this ends.
+static bool awaits() {
+ static const bool ok=[]{
+  if(!isRenderServer() || !available())return false;
+  const uint64_t answer=call(0,nullptr,0,2);
+  if(answer==0x5265616457616974ull)return true;   // "ReadWait"
+  if(answer)call(answer,nullptr,0);
+  return false;
+ }();
+ return ok;
+}
+static void awaitWriters(const std::atomic<uint64_t> &ticket) {
+ if(const uint64_t t=ticket.load())if(awaits())call(t,nullptr,0,1);
+}
 }
 // Held while a resource wait reads an in-flight command buffer's runtime handle and while a locally refused command buffer frees it.
 static std::mutex &gRuntimeHandleLock=*new std::mutex;   // never destroyed (see gAskedLock)
@@ -3449,6 +3478,89 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
  [(id<MTLCommandBuffer>)readback commit];
 }
 
+// Scheduling as Metal reports it (schedpace). Metal calls a command buffer scheduled once the GPU has taken it, which on Apple's GPUs
+// is at most a few command buffers ahead of the one it completes. iPadOS 27.0.1's WebKit paces a WebGPU canvas on nothing else
+// (prepareForDisplay waits for the queue's submitted work to be scheduled, Queue::onSubmittedWorkScheduled; its in-flight frame
+// limit and frame pacer came in August 2026). Here the runtime submits at once and the driver queues without limit, so a page
+// whose frames take the GPU longer than a refresh queues frame after frame: and the render server, which reads the canvas's
+// surface only once the work queued before that writes it is done (the kernel's awaitWriters), waits for all of it. So a command
+// buffer's scheduled handlers (and waitUntilScheduled) wait until fewer than depth() command buffers committed before it on its
+// queue are still uncompleted; each completion lets the next ones through, in commit order, and none waits longer than
+// kPaceCapMs (work that waits for the waiting thread, as an event the CPU signals after waitUntilScheduled, would otherwise never
+// end). Not in the render server, whose frames are paced on the display. webgpu-samples' deferredRendering on 5566 (60 ms of GPU
+// a frame): 14.6-15 frames shown a second, the render server's reads of the canvas waiting 62 ms on average and 5-15 % of them the
+// kernel's whole 100 ms; without the pacing 9.3-9.8, every read waiting the whole 100 ms (WebKit's queue ahead of the canvas).
+namespace schedpace {
+static constexpr int64_t kPaceCapMs=1000;
+static std::atomic<uint64_t> gHeld{0},gCapped{0};
+// How many earlier uncompleted command buffers a scheduling waits behind: 3. A/B: while /private/var/ngpu/debug/no-scheduled-pacing
+// exists when the process starts, 0 (scheduled at submission, as before); /private/var/ngpu/debug/scheduled-depth, where the
+// process may read it, another depth (WebKit's GPU process may not: its sandbox lets it ask whether a file exists, not read it).
+static uint32_t depth() {
+ static const uint32_t value=[]{
+  if(!strcmp(getprogname(),"backboardd"))return 0u;
+  if(access("/private/var/ngpu/debug/no-scheduled-pacing",F_OK)==0)return 0u;
+  uint32_t v=3;
+  if(FILE *file=fopen("/private/var/ngpu/debug/scheduled-depth","r")){unsigned read=0;if(fscanf(file,"%u",&read)==1)v=read;fclose(file);}
+  return v;
+ }();
+ return value;
+}
+// At commit: list the command buffer on its queue.
+static void listed(NBCommandBuffer *commandBuffer) {
+ NBQueue *queue=commandBuffer.queue;
+ if(!queue || !depth())return;
+ std::lock_guard<std::mutex> lock(queue->paceLock);
+ queue->paceList.push_back((__bridge void *)commandBuffer);
+ commandBuffer->paceListed=true;
+}
+// The runtime has submitted it: whether its scheduling waits (then a completion before it, or the cap, delivers it).
+static bool held(NBCommandBuffer *commandBuffer) {
+ NBQueue *queue=commandBuffer.queue;
+ if(!queue || !commandBuffer->paceListed)return false;
+ {
+  std::lock_guard<std::mutex> lock(queue->paceLock);
+  const auto &list=queue->paceList;
+  const auto at=std::find(list.begin(),list.end(),(__bridge void *)commandBuffer);
+  if(at==list.end() || (uint32_t)(at-list.begin())<depth())return false;
+  commandBuffer->paceHeld=true;
+ }
+ gHeld++;
+ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,kPaceCapMs*NSEC_PER_MSEC),dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
+  bool late=false;
+  {
+   std::lock_guard<std::mutex> lock(queue->paceLock);
+   late=commandBuffer->paceHeld;commandBuffer->paceHeld=false;
+  }
+  if(late){gCapped++;[commandBuffer deliverScheduled];}
+ });
+ return true;
+}
+// At completion (or a local refusal): unlist it; its own held scheduling first (before its completed handlers), then the held ones
+// that are now within depth(), in commit order.
+static void completed(NBCommandBuffer *commandBuffer) {
+ NBQueue *queue=commandBuffer.queue;
+ if(!queue || !commandBuffer->paceListed)return;
+ bool own=false;
+ std::vector<void *> ready;
+ {
+  std::lock_guard<std::mutex> lock(queue->paceLock);
+  auto &list=queue->paceList;
+  const auto at=std::find(list.begin(),list.end(),(__bridge void *)commandBuffer);
+  if(at!=list.end())list.erase(at);
+  commandBuffer->paceListed=false;
+  own=commandBuffer->paceHeld;commandBuffer->paceHeld=false;
+  for(size_t i=0;i<list.size() && i<depth();i++) {
+   NBCommandBuffer *next=(__bridge NBCommandBuffer *)list[i];
+   if(next->paceHeld){next->paceHeld=false;ready.push_back(list[i]);}
+  }
+ }
+ if(own)[commandBuffer deliverScheduled];
+ // Each listed one is alive until its own completion, which takes the lock this list was made under.
+ for(void *next:ready)[(__bridge NBCommandBuffer *)next deliverScheduled];
+}
+}  // namespace schedpace
+
 @implementation NBCommandBuffer
 // IOGPUMetalCommandBuffer's userDictionary: a mutable dictionary per command buffer, which MPS keeps its per-buffer state in (nil lost it).
 static char kUserDictionaryKey;
@@ -3675,7 +3787,7 @@ static void noteSampleBuffers(id attachments,const char *what) {
 }
 - (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:true];}
 - (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:false];}
-// The runtime has submitted the work. Deliver scheduling without waiting for GPU completion.
+// The runtime has submitted the work: its scheduling, now or once enough of the queue's earlier work completed (schedpace).
 - (void)didSchedule {
  displayhold::end(holdTicket);
  {
@@ -3684,21 +3796,24 @@ static void noteSampleBuffers(id attachments,const char *what) {
   CommitRecord &r=gCommitRing[self.commitIndex%32];
   if(r.index==self.commitIndex)r.scheduledUs=took;
  }
+ if(schedpace::held(self))return;
+ [self deliverScheduled];
+}
+// Scheduled handlers, then waitUntilScheduled's waiters, once: on the runtime's scheduled-handler thread, preserving its ordering and
+// own-wait deadlock checks, or where a held scheduling was let through. The queue's completionQueue routes completed handlers only.
+- (void)deliverScheduled {
  NSArray *handlers;
  @synchronized(self){
+  if(_schedulingDelivered)return;
   _schedulingDelivered=YES;handlers=[_scheduledHandlers copy];[_scheduledHandlers removeAllObjects];
  }
- void (^run)(void)=^{
-  for(MTLCommandBufferHandler block in handlers)block((id<MTLCommandBuffer>)self);
-  dispatch_group_leave(self->_schedulingHandlers);
- };
- // Run on the runtime's scheduled-handler thread, preserving its ordering and own-wait
- // deadlock checks. The queue's completionQueue routes completed handlers only.
- run();
+ for(MTLCommandBufferHandler block in handlers)block((id<MTLCommandBuffer>)self);
+ dispatch_group_leave(_schedulingHandlers);
 }
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
  displayhold::end(holdTicket);   // a command buffer that never scheduled (a refusal) holds no swap back
+ schedpace::completed(self);   // its own held scheduling before its completed handlers; the queue's next ones through
  surfacesync::end(surfaceTicket);   // its GPU work is done: a lock of its surfaces waits for it no more
  flushSurfaces(_surfaces);
  // Actual GPU completion (or a local refusal that never submitted) is the
@@ -3758,6 +3873,7 @@ static void noteSampleBuffers(id attachments,const char *what) {
  dispatch_group_enter(_handlers);
  dispatch_group_enter(_schedulingHandlers);
  @synchronized(gInFlight){[gInFlight addObject:self];}
+ schedpace::listed(self);
  surfaceTicket=surfacesync::begin(_surfaces,_writtenSurfaces);   // before the commit returns: the caller may lock a surface next
  ENCODE([self submit]);
  encodeFlush();
@@ -3768,6 +3884,7 @@ static void noteSampleBuffers(id attachments,const char *what) {
   flushSurfaces(_surfaces);
   if(gLogTextures)dumpSurfacesOnce(_surfaces,_resourceOwners);
   for(WatchedSource &source:watched){source.hash=hashSource(source.bytes,source.length);gSourcesWatched[source.surface]++;}
+  surfacesync::awaitWriters(surfaceTicket);   // the render server's reads of other processes' surfaces wait for their writers
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
   const uint64_t appIndex=self.dumpReadback?0:gAppCommits.fetch_add(1)+1;
@@ -5429,8 +5546,8 @@ extern "C" size_t nmb_split_row(char *out,size_t size) {
  out[0]=0;
  uint64_t c[13]={};
  if(!gDevice || !nmb_device_split_counts(gDevice,c))return 0;
- const int n=snprintf(out,size,"splits commits %llu ins %llu inl %llu | bar %llu (unneeded %llu) tile %llu tmem %llu att %llu fb %llu ml %llu pend %llu exec %llu vis %llu shape %llu\n",
-  (unsigned long long)gCommits.load(),(unsigned long long)c[0],(unsigned long long)c[11],(unsigned long long)c[1],(unsigned long long)c[12],(unsigned long long)c[2],(unsigned long long)c[3],
+ const int n=snprintf(out,size,"splits commits %llu (sched held %llu capped %llu) ins %llu inl %llu | bar %llu (unneeded %llu) tile %llu tmem %llu att %llu fb %llu ml %llu pend %llu exec %llu vis %llu shape %llu\n",
+  (unsigned long long)gCommits.load(),(unsigned long long)schedpace::gHeld.load(),(unsigned long long)schedpace::gCapped.load(),(unsigned long long)c[0],(unsigned long long)c[11],(unsigned long long)c[1],(unsigned long long)c[12],(unsigned long long)c[2],(unsigned long long)c[3],
   (unsigned long long)c[4],(unsigned long long)c[5],(unsigned long long)c[6],(unsigned long long)c[7],(unsigned long long)c[8],
   (unsigned long long)c[9],(unsigned long long)c[10]);
  return n>0?(size_t)n:0;

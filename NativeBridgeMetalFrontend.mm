@@ -5094,9 +5094,12 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();
  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);
- // Metal builds a kernel that reads a constant nobody set; the runtime refuses it: once more with those constants zero.
+ // Metal builds a kernel that reads a constant nobody set; the runtime refuses it: once more with those constants zero. The rebuilt
+ // function lives to the end of the call, as the reflection below reads its handle: held in the block alone, it went with the block,
+ // and the reflection read a released function (cameracaptured's CCPortrait kernels: SIGSEGV at 0 in the precompilation, every boot).
+ NBFunction *rebuilt=nil;
  if(!handle) {
-  NBFunction *rebuilt=zeroRestFunction((NBFunction *)d.computeFunction);
+  rebuilt=zeroRestFunction((NBFunction *)d.computeFunction);
   if(rebuilt){p.function=rebuilt.handle;handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);}
  }
  gTimePipeline.add(pipelineBegan);

@@ -2358,7 +2358,7 @@ mod reflection_json {
     use metal2vulkan::reflection::{ArrayType, Binding, PointerType, StructType, TextureReferenceType};
     use std::fmt::Write;
 
-    fn string(out: &mut String, s: &str) {
+    pub(super) fn string(out: &mut String, s: &str) {
         out.push('"');
         for c in s.chars() {
             match c {
@@ -2487,6 +2487,25 @@ mod reflection_json {
 
 fn reflection_handle(json: String) -> Result<*mut NmbReflection, String> {
     Ok(boxed(NmbReflection(std::ffi::CString::new(json).map_err(|_| "a NUL in the reflection".to_string())?)))
+}
+
+/// The generic function's constants; specialized functions answer an empty dictionary as Metal does.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_constants(function: *const NmbFunction) -> *mut NmbReflection {
+    guard(std::ptr::null_mut(), || {
+        use std::fmt::Write;
+        let constants = get(function)?.0.function_constants_dictionary().map_err(e("function constants"))?;
+        let mut json = String::from("{\"constants\":[");
+        for (i, (name, constant)) in constants.iter().enumerate() {
+            if i != 0 { json.push(','); }
+            json.push_str("{\"name\":");
+            reflection_json::string(&mut json, name);
+            let _ = write!(json, ",\"type\":{},\"index\":{},\"required\":{}}}",
+                constant.data_type().as_raw(), constant.index(), constant.is_required());
+        }
+        json.push_str("]}");
+        reflection_handle(json)
+    })
 }
 
 /// The reflection of the render pipeline `descriptor` describes: `{"vertex":[...],"fragment":[...]}`.

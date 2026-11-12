@@ -1679,6 +1679,17 @@ static id<MTLArgumentEncoder> argumentEncoder(NmbArgumentEncoder *handle,const c
 @property(nonatomic,strong) NBLibrary *library;      // where it came from (stitching reads its bitcode), and the values it was
 @property(nonatomic,strong) NSData *bitCodeHashData;
 @property(nonatomic,strong) MTLFunctionConstantValues *constantValues;   // specialized with (nil: none), for the zero-rest rebuild of a refused pipeline
+@property(nonatomic,strong) NSDictionary *constantsDictionary;
+@end
+static NSDictionary *reflectionJSON(NmbReflection *reflection,const char *what);
+@interface NBFunctionConstant : MTLFunctionConstant
+@property(nonatomic,copy) NSString *name;
+@property(nonatomic) MTLDataType type;
+@property(nonatomic) NSUInteger index;
+@property(nonatomic) BOOL required;
+@end
+@implementation NBFunctionConstant
+@synthesize name=_name,type=_type,index=_index,required=_required;
 @end
 // MTLDynamicLibrary: iPadOS 27's Core Image keeps its kernel language's standard library as one (CoreImage.framework/CoreImage.metallib,
 // every function exported) and its kernels import from it by install name; the runtime loads it (newDynamicLibraryWithURL:error:) and a
@@ -1696,6 +1707,24 @@ static id<MTLArgumentEncoder> argumentEncoder(NmbArgumentEncoder *handle,const c
 @end
 @implementation NBFunction
 - (void)dealloc {if(_handle)nmb_function_release(_handle);}
+- (NSDictionary<NSString *,MTLFunctionConstant *> *)functionConstantsDictionary {
+ @synchronized(self) {
+  if(!_constantsDictionary) {
+   if(!_handle)return @{};
+   NSDictionary *json=reflectionJSON(nmb_function_constants(_handle),"function constants");
+   if(!json)return nil;
+   NSMutableDictionary *constants=[NSMutableDictionary new];
+   for(NSDictionary *item in json[@"constants"]) {
+    NBFunctionConstant *constant=[NBFunctionConstant new];
+    constant.name=item[@"name"];constant.type=(MTLDataType)[item[@"type"] unsignedIntegerValue];
+    constant.index=[item[@"index"] unsignedIntegerValue];constant.required=[item[@"required"] boolValue];
+    constants[constant.name]=constant;
+   }
+   _constantsDictionary=constants;
+  }
+  return _constantsDictionary;
+ }
+}
 // _MTLFunction's bitCodeHash (32 bytes), read by the stitched-library path (createStitchingScriptHash): a digest naming this function
 // object, its name and a serial no other function in the process has.
 - (const void *)bitCodeHash {

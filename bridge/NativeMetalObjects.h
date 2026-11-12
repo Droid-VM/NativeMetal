@@ -265,6 +265,8 @@ void nmb_render_pipeline_release(NmbRenderPipeline *);
 // A pipeline's reflection, as its creation's `reflection:` answers it, in JSON: {"vertex":[...],"fragment":[...]} for a render pipeline,
 // {"bindings":[...]} for a compute pipeline; each binding has Metal's raw values and a buffer's nested struct/array/pointer types. Null: refused.
 typedef struct NmbReflection NmbReflection;
+/* MTLFunction.functionConstantsDictionary: name, type, index and required for each constant. */
+NmbReflection *nmb_function_constants(const NmbFunction *);
 NmbReflection *nmb_render_pipeline_reflection(const struct NmbRenderPipelineDescriptor *);
 NmbReflection *nmb_compute_pipeline_reflection(const struct NmbComputePipelineDescriptor *);
 const char *nmb_reflection_json(const NmbReflection *);

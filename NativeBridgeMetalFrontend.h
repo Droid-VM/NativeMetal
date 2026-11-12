@@ -9,6 +9,11 @@ extern "C" {
 // Opens the process's one device: loader exports vkGetInstanceProcAddr (Turnip), cache is a writable shader-cache directory, registryID is the
 // accelerator service's registry entry. missing (may be null) is told the class and selector of every unimplemented call.
 id native_bridge_metal_open(const char *loader, const char *cache, uint64_t registryID, void (*missing)(const char *, const char *));
+// The system shader cache (SharedShaderCache.h), named before native_bridge_metal_open. A reader passes the layer's directory and the
+// user ids whose files it trusts there: its device then asks that directory, read only and by the layer's owner and mode rules, for
+// what its own cache lacks. The process that fills the layer passes writer true and opens its device in the layer's directory: what
+// it writes is readable by everyone. Returns whether the layer was taken; the reason of a refusal is in the `cache:` log line.
+bool native_bridge_metal_system_cache(const char *reader, const uint32_t *owners, unsigned count, bool writer);
 // Bare AIR bitcode as a library (the bridge's fixtures; Metal itself accepts only metallibs).
 id native_bridge_metal_library_with_air(const void *bytes, size_t length);
 // One line for the plugin's status report: command buffers committed/failed locally, pipelines made, refusals, the last refusal's text.
@@ -35,5 +40,14 @@ void native_bridge_metal_trim_surface_imports(void);
 // The host says this process is the system's compositor (its render server: the one CoreAnimation display thread that waits on
 // the encode thread for every frame), before its device is opened; until it does, a process named backboardd is one.
 void native_bridge_metal_set_render_server(bool on);
+// Purgeable memory (bridge/NativeMetalPurge.rs). Discards the buffers, textures and heaps their caller declared Volatile or Empty
+// that nothing uses: cause 0 all of them (what the memory pressure handler does), cause 1 those idle for idleMs (what the age timer
+// does, with the runtime's spare block age). Returns the bytes discarded; nothing with the boot argument gpu-purge=0.
+uint64_t native_bridge_metal_purge(uint32_t cause, uint64_t idleMs);
+// The bridge's sixteen purge counts (nmb_device_purge_counts).
+bool native_bridge_metal_purge_counts(uint64_t out[16]);
+// What a memory pressure event does: held surface imports, discardable resources, then the runtime's kept memory. Returns the bytes
+// of the resources discarded.
+uint64_t native_bridge_metal_relieve_memory(void);
 }
 #endif

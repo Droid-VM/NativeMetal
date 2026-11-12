@@ -419,6 +419,19 @@ static id deviceForPort(unsigned port) {
         // (int-261p, int-262, and in system memory int-265). Without it Turnip's autotune picks tile memory (GMEM) or system memory per
         // pass: i553 forced system memory for every pass, the GPU busy 19 % at 680 MHz. A tile store writes whole 16x4 blocks, which the
         // runtime keeps within a texture's rows (bridge patch 0016).
+        // Experiments without a rebuild: each NAME=VALUE line of /private/var/ngpu/debug/env goes into this process's environment
+        // (Turnip's driconf options answer to their names there, tu_dont_care_as_load=true for one), before the defaults below.
+        if (FILE *vars = fopen("/private/var/ngpu/debug/env", "r")) {
+            char line[256];
+            while (fgets(line, sizeof line, vars)) {
+                line[strcspn(line, "\r\n")] = 0;
+                char *equals = strchr(line, '=');
+                if (!equals || equals == line || line[0] == '#') continue;
+                *equals = 0;
+                setenv(line, equals + 1, 1);
+            }
+            fclose(vars);
+        }
         if (FILE *flags = fopen("/private/var/ngpu/tu_debug", "r")) {
             char line[128] = {};
             if (fgets(line, sizeof line, flags)) {line[strcspn(line, "\n")] = 0; setenv("TU_DEBUG", line, 1);}
@@ -440,7 +453,18 @@ static id deviceForPort(unsigned port) {
         // GMEM loads and stores fixed (patches/mesa/turnip-gmem-mutable-swap.patch, lock screen 99.5 % equal to the RGhA picture), the GPU time per
         // command buffer was no better (17.8 ms mean and 56.1 ms at p95 in tile memory, 17.1 and 52.1 in system memory), and one home screen frame
         // still came out with red and blue exchanged. sheng-tu-debug= overrides this for experiments.
-        setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
+        // The render server (backboardd) renders every pass in system memory on this board too. CoreAnimation repaints only the damaged
+        // parts of the display's framebuffers, and a pass of its that Turnip's autotuner sent to tile memory (GMEM) left blocks of
+        // 16x4 texels and whole rectangles of them wrong in the one framebuffer it drew -- zeros, or pieces of an earlier pass -- which
+        // nothing repainted, so they showed on every other frame (2026-11-12, Adreno 840: after leaving and re-entering the app's
+        // console, whose larger repaints go to GMEM, in 3 of 8 tries; with TU_DEBUG=gmem in nearly every one; never in system memory,
+        // 16 of 16). Not the cause: DontCare loads (tu_dont_care_as_load) or stores, hardware binning, bin merging, the host's
+        // preemption or its copy of the frame. What GMEM does wrong there is not known. The cost, measured with every process in
+        // system memory: page swipes and opening Settings at 72.7 and 80.8 fps against 77.3 and 74.3, the GPU's median 9.4 and 8.3 ms a
+        // frame against 7.9 and 8.2 -- within the runs' spread. Other processes keep the autotuner: multisampled passes (wallpapers,
+        // WebKit) cost 4x in system memory. /private/var/ngpu/tu_debug and sheng-tu-debug= above replace this for experiments.
+        const bool renderServer = !strcmp(getprogname(), "backboardd");
+        setenv("TU_DEBUG", renderServer || bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
         // sheng-diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
         if (bootArgSet("sheng-diag=1")) setenv("SHENG_DIAG", "1", 1);

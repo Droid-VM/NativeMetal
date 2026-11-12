@@ -453,18 +453,12 @@ static id deviceForPort(unsigned port) {
         // GMEM loads and stores fixed (patches/mesa/turnip-gmem-mutable-swap.patch, lock screen 99.5 % equal to the RGhA picture), the GPU time per
         // command buffer was no better (17.8 ms mean and 56.1 ms at p95 in tile memory, 17.1 and 52.1 in system memory), and one home screen frame
         // still came out with red and blue exchanged. sheng-tu-debug= overrides this for experiments.
-        // The render server (backboardd) renders every pass in system memory on this board too. CoreAnimation repaints only the damaged
-        // parts of the display's framebuffers, and a pass of its that Turnip's autotuner sent to tile memory (GMEM) left blocks of
-        // 16x4 texels and whole rectangles of them wrong in the one framebuffer it drew -- zeros, or pieces of an earlier pass -- which
-        // nothing repainted, so they showed on every other frame (2026-11-12, Adreno 840: after leaving and re-entering the app's
-        // console, whose larger repaints go to GMEM, in 3 of 8 tries; with TU_DEBUG=gmem in nearly every one; never in system memory,
-        // 16 of 16). Not the cause: DontCare loads (tu_dont_care_as_load) or stores, hardware binning, bin merging, the host's
-        // preemption or its copy of the frame. What GMEM does wrong there is not known. The cost, measured with every process in
-        // system memory: page swipes and opening Settings at 72.7 and 80.8 fps against 77.3 and 74.3, the GPU's median 9.4 and 8.3 ms a
-        // frame against 7.9 and 8.2 -- within the runs' spread. Other processes keep the autotuner: multisampled passes (wallpapers,
-        // WebKit) cost 4x in system memory. /private/var/ngpu/tu_debug and sheng-tu-debug= above replace this for experiments.
-        const bool renderServer = !strcmp(getprogname(), "backboardd");
-        setenv("TU_DEBUG", renderServer || bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
+        // The render server keeps the autotuner like every other process. For a day (2026-11-12) it rendered in system memory here:
+        // its tile memory (GMEM) passes left a zeroed 1536x2400 rectangle and displaced 32x8 blocks in one of the display's two
+        // framebuffers, which showed on every other frame. That was not Turnip's doing: the host had put this guest's compositor
+        // queue in the KGSL ringbuffer of Android's own UI at another priority, whose work came in between the pass's bins
+        // (virglrenderer drm2kgsl, kgsl_priority_flags). /private/var/ngpu/tu_debug and sheng-tu-debug= above still replace this.
+        setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
         // sheng-diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
         if (bootArgSet("sheng-diag=1")) setenv("SHENG_DIAG", "1", 1);

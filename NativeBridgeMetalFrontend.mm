@@ -4777,8 +4777,7 @@ static bool linkedHandles(NSArray<id<MTLFunction>> *functions,std::vector<NmbFun
 // A refused pipeline's function again with every constant it declares and was not given set to zero (nil: not the reason, or no
 // library). Counted in gZeroRest.
 static unsigned gZeroRest;
-static NBFunction *zeroRestFunction(NBFunction *f) {
- NSString *why=lastError();
+static NBFunction *zeroRestFunction(NBFunction *f,NSString *why=lastError()) {
  if(!f.library || ![why containsString:@"FunctionConstant"])return nil;
  NBFunction *rebuilt=(NBFunction *)[f.library nb_newFunctionWithName:f.name constantValues:f.constantValues zeroRest:YES error:nil];
  if(rebuilt)gZeroRest++;
@@ -5298,7 +5297,26 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
  uint64_t cacheBefore[10]={};if(!gJournalPath.empty())nmb_device_work_stats(gDevice,cacheBefore);
  uint32_t programVs=0,programFs=0;nbLastProgram(&programVs,&programFs);   // clear what an earlier creation on this thread left
- NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);gTimePipeline.add(pipelineBegan);
+ NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);
+ __attribute__((objc_precise_lifetime)) MTLRenderPipelineDescriptor *retry=nil;
+ if(!handle && [lastError() containsString:@"FunctionConstant"]) {
+  // As for compute pipelines, preserve explicit constants and supply zero for the remaining reads.
+  // Keep the original error for both stages: rebuilding the vertex function changes lastError().
+  NSString *why=lastError();
+  NBFunction *vertex=zeroRestFunction((NBFunction *)d.vertexFunction,why);
+  NBFunction *fragment=zeroRestFunction((NBFunction *)d.fragmentFunction,why);
+  if(vertex || fragment) {
+   retry=[d copy];
+   if(vertex)retry.vertexFunction=(id<MTLFunction>)vertex;
+   if(fragment)retry.fragmentFunction=(id<MTLFunction>)fragment;
+   auto *rebuilt=new NBRenderDescriptor();
+   if(renderDescriptor(retry,rebuilt,error)) {
+    delete p;p=rebuilt;
+    handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);
+   } else delete rebuilt;
+  }
+ }
+ gTimePipeline.add(pipelineBegan);
  nbLastProgram(&programVs,&programFs);
  if(handle && reflection && wantsReflection(options))*reflection=(MTLRenderPipelineReflection *)renderReflection(p);
  delete p;

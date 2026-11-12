@@ -5280,9 +5280,12 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();
  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);
- // Metal builds a kernel that reads a constant nobody set; the runtime refuses it: once more with those constants zero.
+ // Metal builds a kernel that reads a constant nobody set; the runtime refuses it: once more with those constants zero. The rebuilt
+ // function lives to the end of the call, as the reflection below reads its handle: held in the block alone, it went with the block,
+ // and the reflection read a released function (cameracaptured's CCPortrait kernels: SIGSEGV at 0 in the precompilation, every boot).
+ NBFunction *rebuilt=nil;
  if(!handle) {
-  NBFunction *rebuilt=zeroRestFunction((NBFunction *)d.computeFunction);
+  rebuilt=zeroRestFunction((NBFunction *)d.computeFunction);
   if(rebuilt){p.function=rebuilt.handle;handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);}
  }
  gTimePipeline.add(pipelineBegan);
@@ -5504,7 +5507,7 @@ static NSString *familyBlockers(id,SEL,NSInteger family) {
  return [NSString stringWithUTF8String:text.c_str()];
 }
 static BOOL (*gFamilyAnswer)(id,SEL,NSInteger);
-enum FamilyCaller {FamilyCallerOther,FamilyCallerRenderBox,FamilyCallerWebGPU};
+enum FamilyCaller {FamilyCallerOther,FamilyCallerRenderBox,FamilyCallerWebGPU,FamilyCallerANGLE};
 // The framework whose code is at a return address, looked up once per address: dladdr searches the image's symbol table, and
 // QuartzCore's pixel-format queries ask supportsFamily: for every surface it makes (a masked corner, a backdrop, a blur's mips) and every
 // IOSurface it checks -- the render server's display thread spent 15% of its running time in that search during page swipes.
@@ -5517,6 +5520,7 @@ static FamilyCaller familyCaller(void *address) {
  if(dladdr(address,&caller) && caller.dli_fname) {
   if(strstr(caller.dli_fname,"/RenderBox.framework/"))kind=FamilyCallerRenderBox;
   else if(strstr(caller.dli_fname,"/WebGPU.framework/"))kind=FamilyCallerWebGPU;
+  else if(strstr(caller.dli_fname,"/libANGLE-shared.dylib"))kind=FamilyCallerANGLE;
  }
  std::lock_guard<std::mutex> hold(lock);
  if(known.size()<4096)known.emplace(address,kind);
@@ -5526,11 +5530,16 @@ static FamilyCaller familyCaller(void *address) {
 // feature set tables list no WebGPU limits for Apple1 to Apple3, so requestAdapter() answered null and every page saw no WebGPU. The rows
 // Apple4 adds that this device refuses (gfxprobe families: imageblocks, tile shaders, raster order groups, post-depth coverage) are the
 // Apple GPUs' tile-memory features, which WebGPU has no API for, so WebGPU alone is told Apple4 (the family its tables start at).
+// WebKit's WebGL (ANGLE's Metal renderer, WebCore.framework/Frameworks/libANGLE-shared.dylib) offers ES 3.0, so WebGL 2, only from Apple4
+// on (ANGLE 09a869c24593, in iPadOS 27's WebKit): ES 3.0 needs 12 vertex uniform blocks, which ANGLE binds through an argument buffer,
+// and Apple3's tier-1 argument buffers count their entries against the 31 buffers a function takes. This device's are tier 2, so ANGLE is
+// told Apple4 too. Its other Apple4 checks pick what this device does: non-uniform dispatch, render passes without attachments, render
+// targets under 4 bytes a pixel, and raster order groups for pixel local storage, which WebKit does not offer pages.
 static BOOL familyForCaller(id self,SEL _cmd,NSInteger family) {
  if(family>=1003 && family<2000) {   // MTLGPUFamilyApple3 to Apple10
   const FamilyCaller kind=familyCaller(__builtin_return_address(0));
   if(kind==FamilyCallerRenderBox)return NO;
-  if(kind==FamilyCallerWebGPU && family==1004)return YES;   // MTLGPUFamilyApple4
+  if((kind==FamilyCallerWebGPU || kind==FamilyCallerANGLE) && family==1004)return YES;   // MTLGPUFamilyApple4
  }
  return gFamilyAnswer(self,_cmd,family);
 }

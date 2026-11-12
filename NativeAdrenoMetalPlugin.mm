@@ -419,6 +419,19 @@ static id deviceForPort(unsigned port) {
         // (int-261p, int-262, and in system memory int-265). Without it Turnip's autotune picks tile memory (GMEM) or system memory per
         // pass: i553 forced system memory for every pass, the GPU busy 19 % at 680 MHz. A tile store writes whole 16x4 blocks, which the
         // runtime keeps within a texture's rows (bridge patch 0016).
+        // Experiments without a rebuild: each NAME=VALUE line of /private/var/ngpu/debug/env goes into this process's environment
+        // (Turnip's driconf options answer to their names there, tu_dont_care_as_load=true for one), before the defaults below.
+        if (FILE *vars = fopen("/private/var/ngpu/debug/env", "r")) {
+            char line[256];
+            while (fgets(line, sizeof line, vars)) {
+                line[strcspn(line, "\r\n")] = 0;
+                char *equals = strchr(line, '=');
+                if (!equals || equals == line || line[0] == '#') continue;
+                *equals = 0;
+                setenv(line, equals + 1, 1);
+            }
+            fclose(vars);
+        }
         if (FILE *flags = fopen("/private/var/ngpu/tu_debug", "r")) {
             char line[128] = {};
             if (fgets(line, sizeof line, flags)) {line[strcspn(line, "\n")] = 0; setenv("TU_DEBUG", line, 1);}
@@ -440,6 +453,11 @@ static id deviceForPort(unsigned port) {
         // GMEM loads and stores fixed (patches/mesa/turnip-gmem-mutable-swap.patch, lock screen 99.5 % equal to the RGhA picture), the GPU time per
         // command buffer was no better (17.8 ms mean and 56.1 ms at p95 in tile memory, 17.1 and 52.1 in system memory), and one home screen frame
         // still came out with red and blue exchanged. sheng-tu-debug= overrides this for experiments.
+        // The render server keeps the autotuner like every other process. For a day (2026-11-12) it rendered in system memory here:
+        // its tile memory (GMEM) passes left a zeroed 1536x2400 rectangle and displaced 32x8 blocks in one of the display's two
+        // framebuffers, which showed on every other frame. That was not Turnip's doing: the host had put this guest's compositor
+        // queue in the KGSL ringbuffer of Android's own UI at another priority, whose work came in between the pass's bins
+        // (virglrenderer drm2kgsl, kgsl_priority_flags). /private/var/ngpu/tu_debug and sheng-tu-debug= above still replace this.
         setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
         // sheng-diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.

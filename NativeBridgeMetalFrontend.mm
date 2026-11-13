@@ -2480,6 +2480,8 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic) uint64_t committedUs;
 @property(nonatomic) uint32_t commitIndex;
 @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
+@property(nonatomic,strong) NSMutableArray *completionWaiters;
+@property(nonatomic) BOOL completionDelivered;   // protected with completionWaiters by @synchronized(self)
 @property(nonatomic,strong) NSMutableSet *surfaces;
 // Of those, the textures it may write (attachments, blits, shader-writable textures and resources used for writing): surfacesync.
 @property(nonatomic,strong) NSMutableSet *writtenSurfaces;
@@ -4273,6 +4275,16 @@ static void noteSampleBuffers(id attachments,const char *what) {
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
+// Swift's async wait resumes after actual completion and the ordinary completed handlers, including registration after completion.
+- (void)__waitUntilCompletedAsync:(MTLCommandBufferHandler)block {
+ @synchronized(self){
+  if(!_completionDelivered){
+   if(!_completionWaiters)_completionWaiters=[NSMutableArray array];
+   [_completionWaiters addObject:[block copy]];return;
+  }
+ }
+ block((id<MTLCommandBuffer>)self);
+}
 // A drawable (RenderBox's CAMetalLayer path) is presented once the GPU has written it: this runtime's scheduling comes before completion.
 - (void)presentDrawable:(id<MTLDrawable>)drawable {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];}
 - (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];}
@@ -4369,6 +4381,9 @@ static void noteSampleBuffers(id attachments,const char *what) {
   frontStage(self->traceNumber,self.commitIndex,12);
   DetailCommandScope commandScope(self->traceNumber);
   for(MTLCommandBufferHandler block in completedHandlers){DetailSpan timing(3,(uintptr_t)(__bridge void *)block,blockInvoke(block),true);block((id<MTLCommandBuffer>)self);}
+  NSArray *waiters;
+  @synchronized(self){self->_completionDelivered=YES;waiters=self->_completionWaiters;self->_completionWaiters=nil;}
+  for(MTLCommandBufferHandler block in waiters)block((id<MTLCommandBuffer>)self);
   frontStage(self->traceNumber,self.commitIndex,13);
   dispatch_group_leave(self->_handlers);
   if(lost)endRenderServerAfterGpuLoss();

@@ -81,3 +81,7 @@ Function constants expose Metal's `required` getter and the dictionary is cached
 `newArgumentEncoderWithBufferBinding:` builds an encoder from the runtime's retained buffer reflection. Each buffer binding owns its type description after the pipeline reflection is released. Argument IDs, offsets and array strides come from that description, including nested resource members; the frontend does not repack them through argument descriptors.
 
 Pipeline reflection preserves the legacy `MTLArgument` getters and declares `MTLBinding` conformance. Buffer, texture and threadgroup bindings use separate subclasses conforming to their corresponding Metal binding protocols, so Swift resource-specific casts succeed without advertising unrelated binding kinds.
+
+## Asynchronous command completion
+
+`__waitUntilCompletedAsync:` resumes Swift completion waiters after actual command completion and ordinary completed handlers. Registration during a completed handler joins the pending waiters; registration after completion calls back immediately. These waiters do not use the render server's early completed-handler policy.

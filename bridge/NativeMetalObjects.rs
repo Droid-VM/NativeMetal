@@ -2825,7 +2825,13 @@ pub extern "C" fn nmb_render_pipeline_release(pipeline: *mut NmbRenderPipeline) 
 /// A pipeline's reflection, as the `reflection:` out-parameter of a pipeline's creation answers it, in JSON for the frontend's
 /// MTLArgument/MTLBinding objects: Metal's raw enumeration values, and a buffer's struct, array, pointer and texture reference types
 /// nested as Metal nests them. GFXBench's NGL engine (Aztec Ruins) finds every uniform's buffer offset and every texture's index in it.
-pub struct NmbReflection(std::ffi::CString);
+pub struct NmbReflection {
+    json: std::ffi::CString,
+    buffers: Vec<(u32, u32, metal2vulkan::reflection::BufferBinding)>,
+}
+
+/// A reflected buffer type retained independently of its pipeline reflection.
+pub struct NmbBufferBinding(metal2vulkan::reflection::BufferBinding);
 
 mod reflection_json {
     use metal2vulkan::reflection::{ArrayType, Binding, PointerType, StructType, TextureReferenceType};
@@ -2958,8 +2964,14 @@ mod reflection_json {
     }
 }
 
-fn reflection_handle(json: String) -> Result<*mut NmbReflection, String> {
-    Ok(boxed(NmbReflection(std::ffi::CString::new(json).map_err(|_| "a NUL in the reflection".to_string())?)))
+fn reflection_handle(json: String, stages: &[(u32, &[metal2vulkan::reflection::Binding])]) -> Result<*mut NmbReflection, String> {
+    let buffers = stages.iter().flat_map(|(stage, bindings)| {
+        bindings.iter().filter_map(move |b| b.buffer().map(|buffer| (*stage, b.index(), buffer.clone())))
+    }).collect();
+    Ok(boxed(NmbReflection {
+        json: std::ffi::CString::new(json).map_err(|_| "a NUL in the reflection".to_string())?,
+        buffers,
+    }))
 }
 
 /// The generic function's constants; specialized functions answer an empty dictionary as Metal does.
@@ -2977,7 +2989,7 @@ pub extern "C" fn nmb_function_constants(function: *const NmbFunction) -> *mut N
                 constant.data_type().as_raw(), constant.index(), constant.is_required());
         }
         json.push_str("]}");
-        reflection_handle(json)
+        reflection_handle(json, &[])
     })
 }
 
@@ -2992,7 +3004,7 @@ pub extern "C" fn nmb_render_pipeline_reflection(descriptor: *const NmbRenderPip
         json.push(',');
         reflection_json::stage(&mut json, "fragment", reflection.fragment_bindings());
         json.push('}');
-        reflection_handle(json)
+        reflection_handle(json, &[(1, reflection.vertex_bindings()), (2, reflection.fragment_bindings())])
     })
 }
 
@@ -3005,14 +3017,29 @@ pub extern "C" fn nmb_compute_pipeline_reflection(descriptor: *const NmbComputeP
         let mut json = String::from("{");
         reflection_json::stage(&mut json, "bindings", reflection.bindings());
         json.push('}');
-        reflection_handle(json)
+        reflection_handle(json, &[(0, reflection.bindings())])
     })
 }
 
 /// The reflection's JSON, valid until its release.
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_reflection_json(reflection: *const NmbReflection) -> *const c_char {
-    guard(std::ptr::null(), || Ok(get(reflection)?.0.as_ptr()))
+    guard(std::ptr::null(), || Ok(get(reflection)?.json.as_ptr()))
+}
+
+/// Copy a buffer binding for a frontend object that may outlive the reflection.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_reflection_buffer_binding(reflection: *const NmbReflection, stage: u32, index: u32) -> *mut NmbBufferBinding {
+    guard(std::ptr::null_mut(), || {
+        let (_, _, binding) = get(reflection)?.buffers.iter().find(|(s, i, _)| *s == stage && *i == index)
+            .ok_or_else(|| "reflection has no buffer binding at this stage and index".to_string())?;
+        Ok(boxed(NmbBufferBinding(binding.clone())))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_binding_release(binding: *mut NmbBufferBinding) {
+    release(binding)
 }
 
 #[unsafe(no_mangle)]
@@ -3469,6 +3496,16 @@ pub extern "C" fn nmb_encoder_wait_fence(encoder: *mut NmbEncoder, fence: *mut N
 /// `MTLArgumentEncoder`: the runtime's encoder, which writes each argument's 8 bytes (a buffer's address plus its offset, any other
 /// object's resource ID) through the argument buffer's mapping at once.
 pub struct NmbArgumentEncoder(ArgumentEncoder);
+
+/// `newArgumentEncoderWithBufferBinding:` uses the reflected layout, not descriptor repacking.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_binding_argument_encoder(device: *const NmbDevice, binding: *const NmbBufferBinding) -> *mut NmbArgumentEncoder {
+    guard(std::ptr::null_mut(), || {
+        let encoder = get(device)?.0.new_argument_encoder_with_buffer_binding(&get(binding)?.0)
+            .map_err(e("buffer binding argument encoder"))?;
+        Ok(boxed(NmbArgumentEncoder(encoder)))
+    })
+}
 
 /// One `MTLArgumentDescriptor`, its raw Metal values.
 #[repr(C)]

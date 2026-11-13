@@ -1783,7 +1783,7 @@ static id<MTLArgumentEncoder> argumentEncoder(NmbArgumentEncoder *handle,const c
 @property(nonatomic,strong) MTLFunctionConstantValues *constantValues;   // specialized with (nil: none), for the zero-rest rebuild of a refused pipeline
 @property(nonatomic,strong) NSDictionary *constantsDictionary;
 @end
-static NSDictionary *reflectionJSON(NmbReflection *reflection,const char *what);
+static NSDictionary *reflectionJSON(NmbReflection *reflection,const char *what,bool release=true);
 @interface NBFunctionConstant : MTLFunctionConstant
 @property(nonatomic,copy) NSString *name;
 @property(nonatomic) MTLDataType type;
@@ -4917,8 +4917,10 @@ static NBTextureReferenceType *reflectionTexture(NSDictionary *json) {
 // Swift clients cast bindings to their resource protocol before walking type information.
 // Keep protocol conformance specific to the binding kind.
 @interface NBBufferArgument : NBArgument <MTLBufferBinding>
+@property(nonatomic) NmbBufferBinding *binding;
 @end
 @implementation NBBufferArgument
+- (void)dealloc {nmb_buffer_binding_release(_binding);}
 @end
 @interface NBTextureArgument : NBArgument <MTLTextureBinding>
 @end
@@ -4949,16 +4951,16 @@ static NBTextureReferenceType *reflectionTexture(NSDictionary *json) {
 - (NSArray *)bindings {return _argumentList;}
 @end
 // The runtime's JSON as objects (nil, with the reason logged, for a refusal).
-static NSDictionary *reflectionJSON(NmbReflection *reflection,const char *what) {
+static NSDictionary *reflectionJSON(NmbReflection *reflection,const char *what,bool release) {
  if(!reflection){NBLOG(@"native-metal: %s reflection refused: %@",what,lastError());return nil;}
  const char *text=nmb_reflection_json(reflection);
  NSData *data=text?[NSData dataWithBytes:text length:strlen(text)]:nil;
  NSDictionary *json=data?[NSJSONSerialization JSONObjectWithData:data options:0 error:nil]:nil;
- nmb_reflection_release(reflection);
+ if(release)nmb_reflection_release(reflection);
  if(![json isKindOfClass:[NSDictionary class]]){NBLOG(@"native-metal: %s reflection is not JSON",what);return nil;}
  return json;
 }
-static NSArray *reflectionArguments(NSArray *bindings) {
+static NSArray *reflectionArguments(NSArray *bindings,NmbReflection *source,uint32_t stage) {
  NSMutableArray *arguments=[NSMutableArray array];
  for(NSDictionary *b in bindings)if([b isKindOfClass:[NSDictionary class]]) {
   Class kind=[NBArgument class];
@@ -4968,23 +4970,30 @@ static NSArray *reflectionArguments(NSArray *bindings) {
    case MTLBindingTypeThreadgroupMemory:kind=[NBThreadgroupArgument class];break;
    default:break;
   }
-  NBArgument *argument=[kind new];argument.json=b;[arguments addObject:argument];
+  NBArgument *argument=[kind new];argument.json=b;
+  if(kind==[NBBufferArgument class])
+   ((NBBufferArgument *)argument).binding=nmb_reflection_buffer_binding(source,stage,(uint32_t)argument.index);
+  [arguments addObject:argument];
  }
  return arguments;
 }
 // Metal answers a reflection where the options ask for argument or buffer type information.
 static bool wantsReflection(MTLPipelineOption options) {return options&(MTLPipelineOptionArgumentInfo|MTLPipelineOptionBufferTypeInfo);}
 static id renderReflection(const NmbRenderPipelineDescriptor *p) {
- NSDictionary *json=reflectionJSON(nmb_render_pipeline_reflection(p),"render pipeline");
- if(!json)return nil;
+ NmbReflection *source=nmb_render_pipeline_reflection(p);
+ NSDictionary *json=reflectionJSON(source,"render pipeline",false);
+ if(!json){nmb_reflection_release(source);return nil;}
  NBRenderPipelineReflection *reflection=[NBRenderPipelineReflection new];
- reflection.vertexList=reflectionArguments(json[@"vertex"]);reflection.fragmentList=reflectionArguments(json[@"fragment"]);
+ reflection.vertexList=reflectionArguments(json[@"vertex"],source,1);reflection.fragmentList=reflectionArguments(json[@"fragment"],source,2);
+ nmb_reflection_release(source);
  return reflection;
 }
 static id computeReflection(const NmbComputePipelineDescriptor *p) {
- NSDictionary *json=reflectionJSON(nmb_compute_pipeline_reflection(p),"compute pipeline");
- if(!json)return nil;
- NBComputePipelineReflection *reflection=[NBComputePipelineReflection new];reflection.argumentList=reflectionArguments(json[@"bindings"]);
+ NmbReflection *source=nmb_compute_pipeline_reflection(p);
+ NSDictionary *json=reflectionJSON(source,"compute pipeline",false);
+ if(!json){nmb_reflection_release(source);return nil;}
+ NBComputePipelineReflection *reflection=[NBComputePipelineReflection new];reflection.argumentList=reflectionArguments(json[@"bindings"],source,0);
+ nmb_reflection_release(source);
  return reflection;
 }
 
@@ -5938,6 +5947,12 @@ static uint64_t icbFlag(id d,const char *name,bool fallback) {
  for(MTLArgumentDescriptor *a in arguments)
   raw.push_back({(uint32_t)a.dataType,(uint32_t)a.index,(uint32_t)a.arrayLength,(uint32_t)a.access,(uint32_t)a.textureType,(uint32_t)a.constantBlockAlignment});
  return argumentEncoder(nmb_argument_encoder_new(gDevice,raw.data(),raw.size()),"newArgumentEncoderWithArguments");
+}
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferBinding:(id<MTLBufferBinding>)binding {
+ if(![(id)binding isKindOfClass:[NBBufferArgument class]]) {
+  NBLOG(@"native-metal: newArgumentEncoderWithBufferBinding: a foreign binding");return nil;
+ }
+ return argumentEncoder(nmb_buffer_binding_argument_encoder(gDevice,[(NBBufferArgument *)binding binding]),"newArgumentEncoderWithBufferBinding");
 }
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d {
  NmbSamplerDescriptor s={(uint64_t)d.minFilter,(uint64_t)d.magFilter,(uint64_t)d.mipFilter,(uint64_t)d.sAddressMode,(uint64_t)d.tAddressMode,(uint64_t)d.rAddressMode,

@@ -78,4 +78,6 @@ Function constants expose Metal's `required` getter and the dictionary is cached
 
 ## Reflection binding protocols
 
+`newArgumentEncoderWithBufferBinding:` builds an encoder from the runtime's retained buffer reflection. Each buffer binding owns its type description after the pipeline reflection is released. Argument IDs, offsets and array strides come from that description, including nested resource members; the frontend does not repack them through argument descriptors.
+
 Pipeline reflection preserves the legacy `MTLArgument` getters and declares `MTLBinding` conformance. Buffer, texture and threadgroup bindings use separate subclasses conforming to their corresponding Metal binding protocols, so Swift resource-specific casts succeed without advertising unrelated binding kinds.

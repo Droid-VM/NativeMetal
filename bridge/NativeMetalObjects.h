@@ -137,6 +137,9 @@ size_t nmb_device_family_blockers(const NmbDevice *, int64_t family, char *out, 
 
 /* Argument encoders (MTLArgumentEncoder): each argument is 8 bytes, written through the argument buffer's mapping at once. */
 typedef struct NmbArgumentEncoder NmbArgumentEncoder;
+typedef struct NmbBufferBinding NmbBufferBinding;
+NmbArgumentEncoder *nmb_buffer_binding_argument_encoder(const NmbDevice *, const NmbBufferBinding *);
+void nmb_buffer_binding_release(NmbBufferBinding *);
 typedef struct {
     uint32_t data_type, index, array_length, access, texture_type, constant_block_alignment;   /* raw Metal values */
 } NmbArgumentDescriptor;
@@ -334,6 +337,7 @@ NmbReflection *nmb_function_constants(const NmbFunction *);
 NmbReflection *nmb_render_pipeline_reflection(const struct NmbRenderPipelineDescriptor *);
 NmbReflection *nmb_compute_pipeline_reflection(const struct NmbComputePipelineDescriptor *);
 const char *nmb_reflection_json(const NmbReflection *);
+NmbBufferBinding *nmb_reflection_buffer_binding(const NmbReflection *, uint32_t stage, uint32_t index);
 void nmb_reflection_release(NmbReflection *);
 
 struct NmbSamplerDescriptor {

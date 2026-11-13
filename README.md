@@ -74,3 +74,8 @@ The macOS plugin entry (the IOGPUMetalDevice subclass), the layout of block-comp
 The macOS port keeps the virtual GPU display-hold and IOSurface access tickets while using the upstream purgeable-resource wrappers. Argument-buffer and indirect-command entry points acquire live resources; a texture GPU resource ID pins its backing for the resource lifetime. The compositor is excluded from application scheduled-handler pacing.
 
 Function constants expose Metal's `required` getter and the dictionary is cached per function. Rebuilt compute and render functions remain alive through pipeline reflection. The macOS board build applies its scanout-only XR10 policy and holds imported video surfaces for commands in flight rather than for the lifetime of cached texture objects.
+
+
+## Reflection binding protocols
+
+Pipeline reflection preserves the legacy `MTLArgument` getters and declares `MTLBinding` conformance. Buffer, texture and threadgroup bindings use separate subclasses conforming to their corresponding Metal binding protocols, so Swift resource-specific casts succeed without advertising unrelated binding kinds.

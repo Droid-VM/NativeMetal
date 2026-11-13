@@ -4886,13 +4886,13 @@ static NBTextureReferenceType *reflectionTexture(NSDictionary *json) {
 }
 // One argument: MTLArgument's getters, and MTLBinding's (with MTLBufferBinding's, MTLTextureBinding's and MTLThreadgroupBinding's),
 // whose `type` values are MTLArgumentType's.
-@interface NBArgument : MTLArgument
+@interface NBArgument : MTLArgument <MTLBinding>
 @property(nonatomic,strong) NSDictionary *json;
 @property(nonatomic,strong) NBStructType *madeStruct;   // made once: callers walk its members by identity
 @end
 @implementation NBArgument
 - (NSString *)name {return _json[@"name"];}
-- (MTLArgumentType)type {return (MTLArgumentType)reflectionValue(_json,@"type");}
+- (MTLBindingType)type {return (MTLBindingType)reflectionValue(_json,@"type");}
 - (MTLBindingAccess)access {return (MTLBindingAccess)reflectionValue(_json,@"access");}
 - (NSUInteger)index {return reflectionValue(_json,@"index");}
 - (BOOL)isActive {return [_json[@"used"] boolValue];}
@@ -4913,6 +4913,20 @@ static NBTextureReferenceType *reflectionTexture(NSDictionary *json) {
 - (BOOL)isDepthTexture {return [_json[@"texture"][@"depth"] boolValue];}
 - (NSUInteger)arrayLength {return _json[@"texture"]?reflectionValue(_json[@"texture"],@"arrayLength"):1;}
 - (NSString *)description {return [NSString stringWithFormat:@"<NBArgument %@ type %lu index %lu>",self.name,(unsigned long)self.type,(unsigned long)self.index];}
+@end
+// Swift clients cast bindings to their resource protocol before walking type information.
+// Keep protocol conformance specific to the binding kind.
+@interface NBBufferArgument : NBArgument <MTLBufferBinding>
+@end
+@implementation NBBufferArgument
+@end
+@interface NBTextureArgument : NBArgument <MTLTextureBinding>
+@end
+@implementation NBTextureArgument
+@end
+@interface NBThreadgroupArgument : NBArgument <MTLThreadgroupBinding>
+@end
+@implementation NBThreadgroupArgument
 @end
 @interface NBRenderPipelineReflection : MTLRenderPipelineReflection
 @property(nonatomic,strong) NSArray *vertexList,*fragmentList;
@@ -4946,7 +4960,16 @@ static NSDictionary *reflectionJSON(NmbReflection *reflection,const char *what) 
 }
 static NSArray *reflectionArguments(NSArray *bindings) {
  NSMutableArray *arguments=[NSMutableArray array];
- for(NSDictionary *b in bindings)if([b isKindOfClass:[NSDictionary class]]){NBArgument *argument=[NBArgument new];argument.json=b;[arguments addObject:argument];}
+ for(NSDictionary *b in bindings)if([b isKindOfClass:[NSDictionary class]]) {
+  Class kind=[NBArgument class];
+  switch((MTLBindingType)reflectionValue(b,@"type")) {
+   case MTLBindingTypeBuffer:kind=[NBBufferArgument class];break;
+   case MTLBindingTypeTexture:kind=[NBTextureArgument class];break;
+   case MTLBindingTypeThreadgroupMemory:kind=[NBThreadgroupArgument class];break;
+   default:break;
+  }
+  NBArgument *argument=[kind new];argument.json=b;[arguments addObject:argument];
+ }
  return arguments;
 }
 // Metal answers a reflection where the options ask for argument or buffer type information.

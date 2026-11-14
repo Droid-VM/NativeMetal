@@ -8,6 +8,7 @@
 // gets its own native device too (its own driver connection, GPU address space and shader cache), as every process does with Apple's
 // own GPU plugin.
 #import <Foundation/Foundation.h>
+#include "NativeRenderServer.h"
 #include <pthread.h>
 #include <thread>
 #include <dlfcn.h>
@@ -35,7 +36,7 @@
 __attribute__((constructor)) static void tripleBufferFromBootArgs() {
     char args[1024] = {};
     size_t size = sizeof(args) - 1;
-    if (strcmp(getprogname(), "backboardd") || sysctlbyname("kern.bootargs", args, &size, nullptr, 0) || !strstr(args, "ca-triple-buffer=1"))
+    if (!nativeIsRenderServer() || sysctlbyname("kern.bootargs", args, &size, nullptr, 0) || !strstr(args, "ca-triple-buffer=1"))
         return;
     auto name = reinterpret_cast<const char *(*)(unsigned)>(dlsym(RTLD_DEFAULT, "CAGetDebugOptionEnvVariableName"));
     auto setOption = reinterpret_cast<void (*)(unsigned, bool)>(dlsym(RTLD_DEFAULT, "CASetDebugOption"));
@@ -51,13 +52,25 @@ __attribute__((constructor)) static void tripleBufferFromBootArgs() {
     }
 }
 
+#if TARGET_OS_OSX
+// macOS (upstream AdrenoMetal bd09ede, from macOS-DroidVM): +[IOGPUMetalDevice registerAcceleratorService:] takes the bundle's
+// MetalPluginClassName only if it subclasses IOGPUMetalDevice; every device the plugin hands out gets IOGPU's answers (IOGPUMetalDeviceShim.h).
+#include "IOGPUMetalDeviceShim.h"
+@interface IOGPUMetalDevice : NSObject
+@end
+#else
 @interface _MTLDevice : NSObject
 @end
+#endif
 @interface NativeAdrenoMetalDeviceBase : NSObject   // only a lock object for the published mode's one-time setup
 @end
 @implementation NativeAdrenoMetalDeviceBase
 @end
+#if TARGET_OS_OSX
+@interface NativeAdrenoMetalDevice : IOGPUMetalDevice
+#else
 @interface NativeAdrenoMetalDevice : _MTLDevice
+#endif
 - (id)initWithAcceleratorPort:(unsigned)port;
 @end
 
@@ -69,12 +82,11 @@ static bool requestedPath(const char *name, char *path, size_t size) {
     Dl_info info = {};
     if (!dladdr(reinterpret_cast<const void *>(&requestedPath), &info) || !info.dli_fname) return false;
     snprintf(path, size, "%s", info.dli_fname);
-    char *slash = strrchr(path, '/');          // the bundle's executable: <dir>/NativeAdrenoMetal.bundle/NativeAdrenoMetal
-    if (!slash) return false;
-    *slash = 0;
-    slash = strrchr(path, '/');
-    if (!slash) return false;
-    snprintf(slash + 1, size - size_t(slash + 1 - path), "%s", name);
+    // The bundle's executable: <dir>/NativeAdrenoMetal.bundle/NativeAdrenoMetal (iPadOS) or
+    // <dir>/NativeAdrenoMetal.bundle/Contents/MacOS/NativeAdrenoMetal (macOS; upstream e17d4b9).
+    char *bundle = strstr(path, "/NativeAdrenoMetal.bundle/");
+    if (!bundle) return false;
+    snprintf(bundle + 1, size - size_t(bundle + 1 - path), "%s", name);
     return access(path, R_OK) == 0;
 }
 static bool requested() {
@@ -102,7 +114,7 @@ static bool readTask(uintptr_t address, void *out, size_t size) {
     vm_size_t got = 0;
     return vm_read_overwrite(mach_task_self(), address, size, (vm_address_t) out, &got) == KERN_SUCCESS && got == size;
 }
-static bool writeTask(uintptr_t address, const void *data, size_t size) {
+[[maybe_unused]] static bool writeTask(uintptr_t address, const void *data, size_t size) {   // iPadOS QuartzCore addresses only
     return vm_write(mach_task_self(), address, (vm_offset_t) data, (mach_msg_type_number_t) size) == KERN_SUCCESS;
 }
 // EXPERIMENT (second report onward): this display path takes plain 8-bit BGRA only, so tell the render server's display that it has neither the deep
@@ -117,7 +129,7 @@ static bool bootArgSet(const char *key) {
     size_t size = sizeof args - 1;
     return sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0 && strstr(args, key);
 }
-static unsigned patchFramebufferBranch(uintptr_t slide) {
+[[maybe_unused]] static unsigned patchFramebufferBranch(uintptr_t slide) {
     const uintptr_t site = 0x184461928 + slide;
     uint32_t word = 0;
     if (!readTask(site, &word, sizeof word)) return 0x6E40;
@@ -507,7 +519,21 @@ static id deviceForPort(unsigned port) {
         if (access("/private/var/ngpu/debug/no-lazy-bos", F_OK) == 0) setenv("TU_DARWIN_LAZY_BOS", "0", 1);
         // With the memory writer (client-mem, below) the runtime keeps a report of its pools' blocks too (0031).
         if (access("/private/var/ngpu/debug/client-mem", F_OK) == 0) setenv("METAL2VULKAN_POOL_REPORT", "1", 1);
-        if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
+#if TARGET_OS_OSX
+        // macOS: Turnip opens the accelerator by its class (AGXAccelerator, package/macos/DroidVMAccelerator.cpp of the board); the
+        // display takes plain rows (no framebuffer compression). The render server is WindowServer (NativeRenderServer.h); every device
+        // gets IOGPU's answers (upstream bd09ede).
+        setenv("TU_DARWIN_SERVICE", "AGXAccelerator", 1);
+        setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+        CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+        if (!nativeIsRenderServer()) {
+            device = clientDevice(port);
+            if (device) iogpu::install(device, port);
+            return device;
+        }
+#else
+        if (!nativeIsRenderServer()) return device = clientDevice(port);
+#endif
         // From here the process is the render server: the frontend's policies for it (the encode thread's priority, ending it
         // after a GPU loss) follow this, not the process's name.
         native_bridge_metal_set_render_server(true);
@@ -568,6 +594,7 @@ static id deviceForPort(unsigned port) {
         setenv("CA_DISPLAY_EDR_HEADROOM", "1", 1);
         setenv("CA_FP16_MIN_HEADROOM", "1e30", 1);
         setenv("CA_ALLOW_EDR_MIRRORING", "0", 1);
+#if !TARGET_OS_OSX   // the stored option values and the framebuffer branch are addresses of iPadOS 27's QuartzCore (24A446)
         if (void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart")) {
             const uintptr_t slide = (uintptr_t)ptrauth_strip(start, ptrauth_key_function_pointer) - 0x1846dce88;
             const float one = 1.0f, never = 1e30f;
@@ -583,7 +610,7 @@ static id deviceForPort(unsigned port) {
             const int64_t onceDone = -1;
             gpu->mark(writeTask(0x1e701bdd9 + slide, &off, sizeof off) && writeTask(0x1e7020780 + slide, &onceDone, sizeof onceDone) &&
                       writeTask(0x1e701bdd9 + slide, &off, sizeof off) ? 0x6E04 : 0x6EF4);
-            if (!strcmp(getprogname(), "backboardd") && bootArgSet("sheng-fb-bgra=1")) gpu->mark(patchFramebufferBranch(slide));
+            if (nativeIsRenderServer() && bootArgSet("sheng-fb-bgra=1")) gpu->mark(patchFramebufferBranch(slide));
             // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
             // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
             // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156), 0x10 the device-is-virtualized byte (0x1e701bdd9).
@@ -594,7 +621,7 @@ static id deviceForPort(unsigned port) {
             static uintptr_t gSlide;
             gSlide = slide;
             pthread_t reader;
-            if (!strcmp(getprogname(), "backboardd") && pthread_create(&reader, nullptr, [](void *arg) -> void * {
+            if (nativeIsRenderServer() && pthread_create(&reader, nullptr, [](void *arg) -> void * {
                 sleep(30);
                 const float headroom = *reinterpret_cast<volatile const float *>(0x1e7021014 + gSlide);
                 const float threshold = *reinterpret_cast<volatile const float *>(0x1e7021104 + gSlide);
@@ -616,6 +643,7 @@ static id deviceForPort(unsigned port) {
             }, gpu) == 0)
                 pthread_detach(reader);
         }
+#endif  // !TARGET_OS_OSX
 #endif
         // On an iPad the render server's queue runs at a high GPU priority (CoreAnimation asks for it with setGPUPriority: when it makes
         // its MetalContext). A Vulkan queue's priority is fixed when the device opens, before that call, so the render server asks the
@@ -637,7 +665,7 @@ static id deviceForPort(unsigned port) {
         // so with a persistent Data store the pipelines were still compiled again each boot (V row hit0). Try the user's Library/Caches first
         // (marker 0x6814); the earlier candidates keep their markers.
         if (const passwd *user = getpwuid(getuid()); user && user->pw_dir && user->pw_dir[0]) {
-            snprintf(candidates[4], sizeof candidates[4] - 16, "%s/Library/Caches/com.apple.backboardd", user->pw_dir);
+            snprintf(candidates[4], sizeof candidates[4] - 16, "%s/Library/Caches/com.apple." NATIVE_RENDER_SERVER, user->pw_dir);
             mkdir(candidates[4], 0700);
             strlcat(candidates[4], "/", sizeof candidates[4]);
         }
@@ -769,6 +797,9 @@ static id deviceForPort(unsigned port) {
             }, nullptr);
         pthread_attr_destroy(&attributes);
         gpu->mark(0x6803);
+#if TARGET_OS_OSX
+        iogpu::install(device, port);
+#endif
         return device;
     }
 }
@@ -776,8 +807,18 @@ static id deviceForPort(unsigned port) {
 
 @implementation NativeAdrenoMetalDevice
 - (id)initWithAcceleratorPort:(unsigned)port {
+#if TARGET_OS_OSX
+    // The registered device is the frontend's object, not this one: IOGPUMetalDevice's own initializer would open an IOGPU user client.
+    // This object is kept, because -[IOGPUMetalDevice dealloc] tears down state its initializer never made (upstream bd09ede).
+    static NSMutableArray *kept;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ kept = [NSMutableArray array]; });
+    @synchronized(kept) {[kept addObject:self];}
+    if (!port) return nil;
+#else
     self = [super init];
     if (!self || !port) return nil;
+#endif
     if (publish::requested()) return publish::deviceForPort(port);
     static bool attempted;
     if (attempted) return nil;
@@ -804,7 +845,11 @@ static id deviceForPort(unsigned port) {
                 auto matching = (void *(*)(const char *))dlsym(iokit, "IOServiceMatching");
                 auto getService = (unsigned (*)(unsigned, void *))dlsym(iokit, "IOServiceGetMatchingService");
                 if (matching && getService) {
+#if TARGET_OS_OSX
+                    const unsigned own = getService(0, matching("AGXAccelerator"));
+#else
                     const unsigned own = getService(0, matching("IOAcceleratorES"));
+#endif
                     if (own) port = own;
                 }
             }

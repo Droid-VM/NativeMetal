@@ -11,6 +11,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include "NativeRenderServer.h"
 #include <os/log.h>
 #include <algorithm>
 #include <array>
@@ -224,7 +225,7 @@ static uint32_t threadCpuUs() {
  return (uint32_t)((uint64_t)(info.user_time.seconds+info.system_time.seconds)*1000000ull+(uint64_t)(info.user_time.microseconds+info.system_time.microseconds));
 }
 static uint32_t threadIdLow() {uint64_t id=0;pthread_threadid_np(NULL,&id);return (uint32_t)id;}
-static bool traceWanted() {static const bool on=diagOn() && !strcmp(getprogname(),"backboardd");return on;}
+static bool traceWanted() {static const bool on=diagOn() && nativeIsRenderServer();return on;}
 static void tracePush(const TraceRec &rec) {
  if(!traceWanted())return;
  const uint32_t at=gTraceHead.fetch_add(1);
@@ -433,13 +434,13 @@ static void traceStartWriter() {
  // records overwrote each other's at their own offsets (untagged-3f2bd680: SpringBoard's header, two interleaved stage sequences).
  // Every process with the diagnostics on reads its own Turnip's pass ring (the slowest-pass row); only the render server writes the file.
  if(!diagOn())return;
- static const bool render=!strcmp(getprogname(),"backboardd");
+ static const bool render=nativeIsRenderServer();
  bool expected=false;
  if(!gTraceStarted.compare_exchange_strong(expected,true))return;
  std::thread([]{
   pthread_setname_np("frame-trace");
   int fd=-1;
-  static const char *const paths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/frames.trace","/private/var/root/Library/Caches/com.apple.backboardd/m2v/frames.trace"};
+  static const char *const paths[]={"/private/var/mobile/Library/Caches/com.apple." NATIVE_RENDER_SERVER "/m2v/frames.trace","/private/var/root/Library/Caches/com.apple." NATIVE_RENDER_SERVER "/m2v/frames.trace"};
   uint32_t written=0,sampled=0;
   struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx;uint64_t gpuBegin,gpuEnd;uint16_t fsInstrs,fsTex,fsSy,fsSs;int8_t fsWaves,fsRegs;uint8_t samples,ds;uint32_t bandwidth,verts,fsHash;};
   struct SubRec {uint64_t ns;uint32_t seq,fence,syncWaitUs,callUs,spaceWaitUs;uint16_t busy;uint8_t chunks,buffers;};
@@ -612,7 +613,7 @@ extern "C" void native_bridge_metal_quiet_problems(bool quiet) {tQuietProblems=q
 // format, then 96 bytes of text "fragment|vertex|why" (names cut to 36 and 24 characters). Not for shader priming, which has its own log.
 static void nbNotePipeline(bool made,bool compute,uint64_t tookUs,uint32_t vsHash,uint32_t fsHash,uint32_t format,const char *fragment,const char *vertex,const char *why) {
  if(!diagOn() || tQuietProblems)return;
- static const bool renderServer=!strcmp(getprogname(),"backboardd");
+ static const bool renderServer=nativeIsRenderServer();
  if(renderServer)return;   // its 122 of 256 rows pushed the poster's out of the kernel's ring; its pipelines are in the shader cache journal
  uint32_t words[30]={};
  words[0]=(made?1u:0u)|(compute?2u:0u);words[1]=(uint32_t)tookUs;words[2]=(uint32_t)nowUs();words[3]=vsHash;words[4]=fsHash;words[5]=format;
@@ -669,7 +670,7 @@ extern "C" void native_bridge_metal_set_render_server(bool on) {gRenderServerSai
 static bool isRenderServer() {
  const int said=gRenderServerSaid.load();
  if(said>=0)return said;
- static const bool named=!strcmp(getprogname(),"backboardd");return named;
+ static const bool named=nativeIsRenderServer();return named;
 }
 static void endRenderServerAfterGpuLoss() {
  static std::atomic<bool> ending{false};
@@ -1075,7 +1076,7 @@ static NBAsked *askedToken(unsigned kind,uint64_t bytes,const NmbTextureDescript
 - (void)countUse;
 @end
 // The render server counts the surfaces it textures in use while the textures live (countUse).
-static const bool gCountsSurfaceUse=!strcmp(getprogname(),"backboardd");
+static const bool gCountsSurfaceUse=nativeIsRenderServer();
 // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
 // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
 // unmap or reuse pages the GPU still reads or writes.
@@ -3498,7 +3499,7 @@ static std::atomic<uint64_t> gHeld{0},gCapped{0};
 // process may read it, another depth (WebKit's GPU process may not: its sandbox lets it ask whether a file exists, not read it).
 static uint32_t depth() {
  static const uint32_t value=[]{
-  if(!strcmp(getprogname(),"backboardd"))return 0u;
+  if(nativeIsRenderServer())return 0u;
   if(access("/private/var/ngpu/debug/no-scheduled-pacing",F_OK)==0)return 0u;
   uint32_t v=3;
   if(FILE *file=fopen("/private/var/ngpu/debug/scheduled-depth","r")){unsigned read=0;if(fscanf(file,"%u",&read)==1)v=read;fclose(file);}

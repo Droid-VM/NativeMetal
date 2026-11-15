@@ -3903,7 +3903,8 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
  else fprintf(stderr,"native-metal dump cb %llu: %lu targets, %u passes, %u kernels\n",(unsigned long long)appIndex,
               (unsigned long)targets.count,source.dumpPasses,source.dumpKernels);
  for(NSString *line in source.dumpLog)fprintf(stderr,"native-metal dump cb %llu: %s\n",(unsigned long long)appIndex,line.UTF8String);
- if(!targets.count)return;
+ // Inspect bindings and draw state without issuing any texture readback commands.
+ if(getenv("NATIVE_METAL_DUMP_TEXT_ONLY") || !targets.count)return;
  NBCommandBuffer *readback=(NBCommandBuffer *)[(id<MTLCommandQueue>)source.queue commandBuffer];
  if(!readback)return;
  readback.dumpReadback=YES;

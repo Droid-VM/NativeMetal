@@ -5341,10 +5341,12 @@ static void fillBaseLimits(id device);
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format {
  return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),format);
 }
-// SPI: the row alignment a read-only texture over an IOSurface needs. Answered unasked it was 0 (a divisor for its callers); the linear
-// texture alignment of the widest common format is the same rule this GPU applies to any linear image.
+// SPI: the row alignment a read-only texture over an IOSurface needs. Answered unasked it was 0 (a divisor for its callers); a plane
+// read only is placed by the same rule as a written one (iosurfaceTextureAlignmentBytes, 16 as on Apple's GPUs). Not the linear
+// alignment of RGBA16Float (128): Core Animation refuses a texture over any surface whose rows miss it ("Row bytes (320) not 128
+// aligned"), and WebKit's 64-byte BGRA8 layers then draw nothing.
 - (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {
- return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),MTLPixelFormatRGBA16Float);
+ return ((NSUInteger (*)(id,SEL))objc_msgSend)(self,sel_registerName("iosurfaceTextureAlignmentBytes"));
 }
 - (uint64_t)registryID {return gRegistryID;}
 - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}

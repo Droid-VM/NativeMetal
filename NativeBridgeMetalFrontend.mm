@@ -1769,6 +1769,7 @@ static id<MTLArgumentEncoder> argumentEncoder(NmbArgumentEncoder *handle,const c
 @property(nonatomic,strong) id storage;          // what keeps the metallib's bytes mapped: its functions' bitcode, for stitching
 @property(nonatomic) const uint8_t *bytes;
 @property(nonatomic) size_t length;
+@property(nonatomic,strong) NSMutableDictionary<NSString *,NSDictionary *> *functionConstants;
 - (id<MTLFunction>)nb_newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values zeroRest:(BOOL)zeroRest
                                     error:(NSError **)error;
 @end
@@ -1793,6 +1794,18 @@ static NSDictionary *reflectionJSON(NmbReflection *reflection,const char *what,b
 @implementation NBFunctionConstant
 @synthesize name=_name,type=_type,index=_index,required=_required;
 @end
+static NSDictionary *functionConstantsDictionary(NmbFunction *handle) {
+ NSDictionary *json=reflectionJSON(nmb_function_constants(handle),"function constants");
+ if(!json)return nil;
+ NSMutableDictionary *constants=[NSMutableDictionary new];
+ for(NSDictionary *item in json[@"constants"]) {
+  NBFunctionConstant *constant=[NBFunctionConstant new];
+  constant.name=item[@"name"];constant.type=(MTLDataType)[item[@"type"] unsignedIntegerValue];
+  constant.index=[item[@"index"] unsignedIntegerValue];constant.required=[item[@"required"] boolValue];
+  constants[constant.name]=constant;
+ }
+ return [constants copy];
+}
 // MTLDynamicLibrary: iPadOS 27's Core Image keeps its kernel language's standard library as one (CoreImage.framework/CoreImage.metallib,
 // every function exported) and its kernels import from it by install name; the runtime loads it (newDynamicLibraryWithURL:error:) and a
 // pipeline stage searches it (preloadedLibraries), or loads it by the install name its library imports from when the pipeline is made.
@@ -1813,16 +1826,24 @@ static NSDictionary *reflectionJSON(NmbReflection *reflection,const char *what,b
  @synchronized(self) {
   if(!_constantsDictionary) {
    if(!_handle)return @{};
-   NSDictionary *json=reflectionJSON(nmb_function_constants(_handle),"function constants");
-   if(!json)return nil;
-   NSMutableDictionary *constants=[NSMutableDictionary new];
-   for(NSDictionary *item in json[@"constants"]) {
-    NBFunctionConstant *constant=[NBFunctionConstant new];
-    constant.name=item[@"name"];constant.type=(MTLDataType)[item[@"type"] unsignedIntegerValue];
-    constant.index=[item[@"index"] unsignedIntegerValue];constant.required=[item[@"required"] boolValue];
-    constants[constant.name]=constant;
+   // Unspecialized functions of one library share immutable metadata. VFX makes fresh
+   // function objects while preparing cached shaders; do not rebuild their JSON each frame.
+   if(_constantValues) {
+    _constantsDictionary=@{};
+   } else if(_library) {
+    @synchronized(_library) {
+     _constantsDictionary=_library.functionConstants[_sourceName];
+     if(!_constantsDictionary) {
+      _constantsDictionary=functionConstantsDictionary(_handle);
+      if(_constantsDictionary) {
+       if(!_library.functionConstants)_library.functionConstants=[NSMutableDictionary new];
+       _library.functionConstants[_sourceName]=_constantsDictionary;
+      }
+     }
+    }
+   } else {
+    _constantsDictionary=functionConstantsDictionary(_handle);
    }
-   _constantsDictionary=constants;
   }
   return _constantsDictionary;
  }

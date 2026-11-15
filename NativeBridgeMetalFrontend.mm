@@ -1307,6 +1307,10 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
  }
  return true;
 }
+// Apart from the interface above, which the board's build-adreno-metal-plugin.py finds as it wrote it.
+@interface NBTexture ()
+@property(nonatomic) BOOL commandUse;   // its surface counted in use only while a command buffer that binds it runs (videoPlanes)
+@end
 @implementation NBTexture
 - (void)dealloc {nmb_texture_release(_handle);if(_surface){if(_counted)IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}}
 - (void)countUse {if(_surface && !_counted && gCountsSurfaceUse){IOSurfaceIncrementUseCount(_surface);_counted=YES;}}
@@ -2193,6 +2197,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic) uint32_t commitIndex;
 @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
 @property(nonatomic,strong) NSMutableSet *surfaces;
+@property(nonatomic,strong) NSMutableArray *surfacesInUse;   // commandUse textures, counted in use from submit to finish
 // Of those, the textures it may write (attachments, blits, shader-writable textures and resources used for writing): surfacesync.
 @property(nonatomic,strong) NSMutableSet *writtenSurfaces;
 // Runtime handles retain GPU storage, but only the Objective-C owner retains
@@ -3817,6 +3822,8 @@ static void noteSampleBuffers(id attachments,const char *what) {
  schedpace::completed(self);   // its own held scheduling before its completed handlers; the queue's next ones through
  surfacesync::end(surfaceTicket);   // its GPU work is done: a lock of its surfaces waits for it no more
  flushSurfaces(_surfaces);
+ for(NBTexture *texture in _surfacesInUse)IOSurfaceDecrementUseCount(texture.surface);
+ _surfacesInUse=nil;
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
  [_surfaces removeAllObjects];[_writtenSurfaces removeAllObjects];[_resourceOwners removeAllObjects];
@@ -3883,6 +3890,11 @@ static void noteSampleBuffers(id attachments,const char *what) {
 - (void)submit {
  if(!self.encodeFailure) {
   flushSurfaces(_surfaces);
+  for(id object in _surfaces)
+   if([object isKindOfClass:[NBTexture class]] && [(NBTexture *)object commandUse] && [(NBTexture *)object surface]) {
+    if(!_surfacesInUse)_surfacesInUse=[NSMutableArray array];
+    IOSurfaceIncrementUseCount([(NBTexture *)object surface]);[_surfacesInUse addObject:object];
+   }
   if(gLogTextures)dumpSurfacesOnce(_surfaces,_resourceOwners);
   for(WatchedSource &source:watched){source.hash=hashSource(source.bytes,source.length);gSourcesWatched[source.surface]++;}
   surfacesync::awaitWriters(surfaceTicket);   // the render server's reads of other processes' surfaces wait for their writers
@@ -4869,6 +4881,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 }
 // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
 // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
+// A video frame's surface in the render server where the runtime reads 4:2:0 planes in place (METAL2VULKAN_YCBCR_PLANES_ONLY, which the
+// plugin sets for macOS's WindowServer): 8- and 10-bit two-plane YCbCr (500, 505) over plane 0. Its texture reads the frame's own pages
+// when a pass samples it, so the surface counts as in use from the submit of each command buffer that binds it until that one finishes
+// (commandUse), not for the texture's life: the server keeps a texture of each surface of a decoder's pool, and counted for its life
+// every pool surface stayed in use and the pool grew without end (macOS's lock-screen Aerial: 44 surfaces of 26.7 MB, the guest out of
+// memory, VideoToolbox's pixel buffer requests answered too late, no picture). Droid-VM/macOS-DroidVM's P4 (3623549).
+static bool videoPlanes(MTLTextureDescriptor *d,NSUInteger plane) {
+ static const bool on=nativeIsRenderServer() && getenv("METAL2VULKAN_YCBCR_PLANES_ONLY");
+ return on && plane==0 && (d.pixelFormat==500 || d.pixelFormat==505);
+}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
  // A planar surface (Apple's lossless-compressed BGRA spelling has one plane, video formats two) is imported whole; the texture starts at
  // the plane's own address and rows. Only a plain surface has no planes, and then only plane 0 exists.
@@ -4888,6 +4910,12 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
+ if(videoPlanes(d,plane)) {
+  static std::atomic<unsigned> told;
+  if(told++<4)NBLOG(@"native-metal: surface texture %lux%lu YCbCr format %lu read in place, in use while a command buffer reads it",
+                    (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat);
+  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);texture.commandUse=YES;return (id<MTLTexture>)texture;
+ }
  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);[texture countUse];return (id<MTLTexture>)texture;
 }
 // One L line per library made (its source, size and function names), and with /private/var/ngpu/debug/dump-libraries each library made

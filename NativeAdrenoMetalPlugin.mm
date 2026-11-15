@@ -33,6 +33,18 @@
 // only after the last one's buffer came back, which it does whenever a frame took longer than a refresh -- and a frame's GPU work
 // returns 8-12 ms after its commit through a virtual GPU. The option's index is found by its name (CAGetDebugOptionEnvVariableName;
 // 200 in iPadOS 27's QuartzCore, 198 in macOS 27's), so a QuartzCore that numbers its options otherwise is not given another one.
+// macOS's WindowServer (the render server there; iPadOS's is backboardd, which this leaves alone): its 4:2:0 YCbCr surface textures
+// -- video frames, the lock screen's Aerial wallpaper a 4096x2160 10-bit pool of them -- are made over their planes alone, which its
+// shaders read in place (the board's patches/metal2vulkan, METAL2VULKAN_YCBCR_PLANES_ONLY): not an image of converted texels and a
+// staging copy, about 100 MiB per 4K texture, for every pool surface the server keeps a texture of. The frontend then counts such a
+// surface in use only while a command buffer that reads it runs (NBTexture commandUse), so the decoder's pool gets its surfaces back.
+// Droid-VM/macOS-DroidVM's P4 (3623549). /private/var/ngpu/debug/no-ycbcr-planes turns it off.
+__attribute__((constructor)) static void videoPlanesInPlace() {
+    if (!nativeIsRenderServer() || strcmp(getprogname(), "WindowServer") != 0) return;
+    if (access("/private/var/ngpu/debug/no-ycbcr-planes", F_OK) == 0) return;
+    setenv("METAL2VULKAN_YCBCR_PLANES_ONLY", "1", 0);
+}
+
 __attribute__((constructor)) static void tripleBufferFromBootArgs() {
     char args[1024] = {};
     size_t size = sizeof(args) - 1;

@@ -33,7 +33,9 @@
 #include "NativeGpuTrace.h"
 #include "NativeMetalBridgePhase.h"
 #include "CacheExport.h"
+#if !TARGET_OS_OSX
 #include "PrimeShaders.h"
+#endif
 #include "ExceptionDiag.h"
 #include <atomic>
 
@@ -349,6 +351,14 @@ static id clientDevice(unsigned port) {
     CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
     boundPooledBlocks();
     boundClientBoCache();
+#if TARGET_OS_OSX
+    if (geteuid() == 0 && getenv("NATIVE_METAL_PRIMER")) {
+        const std::string root = systemcache::writerDirectory();
+        if (root.empty()) return nil;
+        native_bridge_metal_system_cache(nullptr, nullptr, 0, true);
+        return native_bridge_metal_open(turnip, root.c_str(), registryID, nullptr);
+    }
+#endif
     char candidates[3][512] = {};
     if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
     if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
@@ -496,10 +506,20 @@ static id deviceForPort(unsigned port) {
         // framebuffers, which showed on every other frame. That was not Turnip's doing: the host had put this guest's compositor
         // queue in the KGSL ringbuffer of Android's own UI at another priority, whose work came in between the pass's bins
         // (virglrenderer drm2kgsl, kgsl_priority_flags). /private/var/ngpu/tu_debug and tu-debug= above still replace this.
+        // A740 has the sampler's built-in border constants (AdrenoMetal turns this on by default); tu-fbc=1 turns it on here, where the
+        // A8xx's was not checked.
+        if (bootArgSet("tu-fbc=1")) setenv("tu_enable_fast_border_color_for_undefined_formats", "true", 0);
         // diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
         if (bootArgSet("diag=1") || bootArgSet("gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
         else unsetenv("SHENG_DIAG");
+        if (getenv("SHENG_DIAG")) {
+            char boot[64] = {};
+            size_t size = sizeof boot - 1;
+            if (!sysctlbyname("kern.bootsessionuuid", boot, &size, nullptr, 0)) setenv("NATIVE_METAL_BOOT_SESSION", boot, 1);
+            setenv("METAL2VULKAN_ENCODER_TIMES", "8ms", 1);
+            setenv("METAL2VULKAN_QUEUE_TIMES", "1", 1);
+        }
         if (bootArgSet("gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
         else unsetenv("SHENG_GPU_TRACE");
         // The bridge's work placement (metal-flow=<bits>, read below). Any value logs the FL counts
@@ -574,6 +594,35 @@ static id deviceForPort(unsigned port) {
         if (access("/private/var/ngpu/debug/no-lazy-bos", F_OK) == 0) setenv("TU_DARWIN_LAZY_BOS", "0", 1);
         // With the memory writer (client-mem, startMemoryWriter) the runtime keeps a report of its pools' blocks too (0031).
         if (access("/private/var/ngpu/debug/client-mem", F_OK) == 0) setenv("METAL2VULKAN_POOL_REPORT", "1", 1);
+#if TARGET_OS_OSX
+        // ci-mps=0 selects Core Image's own blur kernels. Core Image reads this at its first blur;
+        // an explicit environment value takes precedence.
+        if (bootArgSet("ci-mps=0")) setenv("CI_ENABLE_MPS", "0", 0);
+        if (!strcmp(getprogname(), "iconservicesagent")) {
+            char args[1100] = {};
+            size_t size = sizeof args - 1;
+            if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
+                if (const char *at = bootArgToken(args, "icon-cb=")) {
+                    unsigned first = 0, count = 0, pass = 0, skipFirst = 0, skipLast = 0;
+                    const int fields = sscanf(at + strlen("icon-cb="), "%u:%u:%u:%u:%u", &first, &count, &pass, &skipFirst, &skipLast);
+                    if ((fields == 2 || fields == 5) && first && count && count <= 32) {
+                        char range[32];snprintf(range, sizeof range, "%u:%u", first, count);
+                        setenv("NATIVE_METAL_DUMP_CB", range, 0);
+                        setenv("NATIVE_METAL_DUMP_LOG", "1", 0);
+                        setenv("NATIVE_METAL_DUMP_FILE", "1", 0);
+                        setenv("NATIVE_METAL_DUMP_PASS", "1", 0);
+                        setenv("NATIVE_METAL_DUMP_INPUTS", "1", 0);
+                        setenv("NATIVE_METAL_DUMP_DRAWS", "1:64", 0);
+                        setenv("NATIVE_METAL_DUMP_WORDS", "32", 0);
+                        setenv("NATIVE_METAL_DUMP_FUNCTIONS", "alpha_effect,accumulator_color,stroke_lines,plane_color,primitive_image", 0);
+                        if (fields == 5 && pass && skipFirst && skipLast >= skipFirst) {
+                            char skip[48];snprintf(skip, sizeof skip, "%u:%u:%u", pass, skipFirst, skipLast);
+                            setenv("NATIVE_METAL_SKIP_DRAWS", skip, 0);
+                        }
+                    }
+                }
+        }
+#endif
 #if TARGET_OS_OSX
         // macOS: Turnip opens the accelerator by class (AGXAccelerator here); the display takes plain rows (no Apple framebuffer or IOSurface
         // compression). The runtime keeps its default block size: the virtual-machine board shrank it for a 512 MiB GPU pool, which this
@@ -806,12 +855,11 @@ static id deviceForPort(unsigned port) {
                 return nullptr;
             }, gpu);
         }
-        // Every Metal library of the OS through the runtime, 90 s after the render server opened the device (PrimeShaders.h); the boots that froze
-        // or crashed before three minutes never primed anything. Progress is kept in the Data cache directory, so later boots resume.
-        // The translator recurses deeply on large functions: give it the stack of a main thread.
+#if !TARGET_OS_OSX
+        // The iPadOS primer uses an 8 MiB stack for large translated functions.
         pthread_attr_setstacksize(&attributes, 8u << 20);
         pthread_t primer;
-        pthread_create(&primer, &attributes, [](void *) -> void * {
+        if (!bootArgSet("gpu-prime=0")) pthread_create(&primer, &attributes, [](void *) -> void * {
                 pthread_setname_np("native-metal-prime");   // a process sample and the telemetry's TH rows name its CPU time
                 char list[1024];
                 prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
@@ -819,6 +867,7 @@ static id deviceForPort(unsigned port) {
                            gFillsSystemCache);
                 return nullptr;
             }, nullptr);
+#endif
         pthread_attr_destroy(&attributes);
         // The GMEM colour order test (NativeTurnipSwapTest.h), once, 20 s after the device is published: each result line goes to the
         // kernel's GPU trace as a problem record (event 65).

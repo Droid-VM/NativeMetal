@@ -2,11 +2,29 @@
 
 Metal frontend through metal2vulkan and Turnip.
 
+The runtime uses the complete metal2vulkan `development` tree at `555b13d57e09bff70996a88cff64f1275256d5cf`, with the recorded consumer patch. A740 uses native float operations and RelaxedPrecision for eligible half instructions; float controls and PrecisionNote retain the device's precision bounds. Turnip enables concurrent binning and built-in fast border colors. `tu-cb=0` and `tu-fbc=0` select their diagnostic controls.
+
+From the resolved UniXNU tree, `python3 drivers/AdrenoMetal/tools/audit-runtime-fast-paths.py --fetch-mesa --output build/runtime-fast-paths.json` reports the source policy fields, float controls, accuracy ledger and pinned Turnip option registry. `--runtime-policy <runtime-policy.log>` attaches a captured device profile and runtime checks. Math operations follow upstream `Math::float_stems()`, `BinOp::ALL` and `PrecisionNote`, with their existing validation.
+
 The frontend uses metal2vulkan and Turnip with the kernel GPU interface and selected OS ABI. GPU composition has been verified on sheng with A740.
 
 All clients use single-sample rendering by default. `NATIVE_METAL_SINGLE_SAMPLE=0` preserves a process's requested sample counts; `1` forces single-sample rendering. Texture types, pipeline sample counts and resolve outputs follow the selected policy. Same-user clients share writable shader caches. Resource aliasing, swizzles, range copies, function constants, specialized link names and allocation queries reach the runtime. Queue priorities aggregate current live requests without a process-name policy.
 
+Texture creation, heap size queries and texture views preserve
+`allowGPUOptimizedContents`. A caller that requests an unoptimized layout keeps
+that layout through the frontend and runtime.
+
+Function lookup returns `MTLLibraryErrorFunctionNotFound` when the requested name is absent from the library.
+
 Build and interface details: [documentation](https://unixnu.com/drivers/adreno-metal). Component sources and dependencies: [catalog](https://unixnu.com/reference/components).
+
+## Native half arithmetic
+
+A740 uses native float32 multiply-add for a half FMA, then converts the result to half. The product of two half operands is exact in float32; normal half operands and results stay within one half ULP of the fused result.
+
+Relaxed half division scales both operands by a power of two before the native16 division: divisors above `2^14` use `2^-2`, and divisors below `2^-14` use `2^10`. The normalized division has Vulkan's bound of 2.5 half ULP for normal operands and results. The profile's denormal behavior applies to half inputs, intermediate values and results; `NativeHalfConversion` records the native half route.
+
+Eligible half arithmetic and math functions use the device's 16-bit precision through `RelaxedPrecision` under `HalfChainPolicy::AtExits`. Their normal-range precision follows the selected native instruction and `PrecisionNote`. The runtime policy log records the device's float controls alongside the policy.
 
 ## Memory reuse
 
@@ -34,22 +52,31 @@ A two-plane YCbCr texture over an IOSurface (a video frame: `MTLPixelFormatYCBCR
 
 `gpu-ycbcr-planes=0` makes every such texture with its converted image (`NATIVE_METAL_YCBCR_PLANES=0` selects the same in a process).
 
+MSL source compilation passes `mathMode` (safe, relaxed or fast) and `mathFloatingPointFunctions` (fast or precise FP32 functions) independently to the compiler. Older option objects use `fastMathEnabled`.
+
 ## Shader caches and priming
+
+Function reflection exposes vertex and stage-input attributes with their indices, data types and activity. Priming uses reflected constants and vertex inputs, and selects executable entry points from container stage tags. Apple GPU machine-code archives are listed separately from AIR inputs. Successful checkpoints retain their translator and driver identity; refused checkpoints include the primer input revision.
 
 Each process keeps its pipeline cache in the first directory its sandbox lets it write: the same-user shared directory, then Metal's own cache directory. Compiler replies for source and stitched libraries are kept beside it. A cache entry's access time is refreshed on a hit until the platform refuses the change once.
 
-The render server primes Metal libraries in the background while it draws nothing. On macOS any command buffer in the last quarter second counts as drawing.
+On macOS, Shader Cache displays library progress, compiled functions, failures and missing inputs. Start requests compilation through an administrator-authorized worker; Stop finishes the current compilation and saves progress. Starting again retains successful checkpoints and retries failed entries. The app is installed at `/Library/GPUBundles/Shader Cache.app`, with an Applications entry in the sheng lab. Its `--status` argument prints the current state as JSON.
+
+On iPadOS, the render server compiles the inventory while idle. The build embeds the OS library inventory, and `prime.log` records the build, scope and completion result.
 
 ### System shader cache (macOS)
 
-The render server and the apps are different users, and a sandboxed process may not write the user's shared directory. The render server therefore fills one directory that every process reads:
+The kernel creates `/private/var/tmp/NativeAdrenoMetal.cache` for `_windowserver`, with mode 0755, and exposes it read-only at `/Library/GPUBundles/NativeAdrenoMetal.cache`. The authorized Shader Cache worker and the render server publish readable, versioned entries there. Other clients consult this layer after their own caches.
 
-- The kernel makes `/private/var/tmp/NativeAdrenoMetal.cache` at boot (owner `_windowserver`, mode 0755), a place the render server's sandbox lets it write, and shows it read-only at `/Library/GPUBundles/NativeAdrenoMetal.cache`, which every sandbox that may use graphics can read.
-- The render server opens its device in the first directory. Its pipeline cache entries, driver pipeline data and compiler replies are readable by everyone, and it primes every library of the list except those of other GPUs' driver bundles (`/System/Library/Extensions/*.bundle`).
-- Every other process asks its own cache first and the second directory for what that lacks. It never writes there.
-- A reader trusts the directory by who can write it: the directory, every directory on the way to an entry and the entry must be owned by root or `_windowserver` and not writable by group or others, and each is opened without following a link. An entry is then checked like one of the process's own cache. A level that fails is not read and is counted.
+Readers accept root or `_windowserver` ownership, reject group- or world-writable entries and traverse without following symlinks. Each entry is checked against its build, profile and contents. `gpu-prime-system=0` selects private process caches. Mesa's disk cache remains per process; runtime driver pipeline entries provide shared compiled data.
 
-Without the kernel's directory the render server keeps its own cache and primes only the libraries of bundles loaded in its own process. `gpu-prime-system=0` selects the same and stops every process from reading the system directory. Mesa's own disk cache stays per process; the driver's compiled pipelines reach other processes through the runtime's pipeline data entries.
+## Priming results
+
+Priming covers default compute and vertex pipeline variants. Successful functions are recorded in `prime-fn2`, refused functions in `prime-refused2`, and a fully compiled library in `prime-done`. Checkpoints include the runtime build. `prime-current` identifies an interrupted compile and `prime-bad` retains that function for the same build.
+
+On macOS, `shader-cache.plist` records the App's progress and result. On iPadOS, `PR` and `PRc` report the primer's counters. Run UniXNU's `scripts/analyze-metal-prime.py` against a captured cache directory to summarize its checkpoints.
+
+`FP` reports submission grouping, command-pool reuse, in-place linear passes and region pipeline eviction. `CM` records cumulative commit time in microseconds, separated into lowering, recording, pipeline wait, lock wait, scheduler pass and submission.
 
 ## Telemetry table
 
@@ -57,13 +84,17 @@ With `diag=1`, the render server sends its telemetry table to the kernel log (`[
 
 ## Frame diagnostics
 
+With `diag=1`, the cache directory also contains `timing.log` (512 KiB) and `runtime-policy.log` (64 KiB). Timing lines contain boot, component, runtime and monotonic `uptime_us` identifiers. Encoder summaries are written every five seconds; command buffers taking at least 8 ms include encoder details. The policy log records actual Vulkan identity, float capabilities and submission, queue-switch and in-place checks.
+
 With `gpu-trace=1`, the render server writes command phases, encoding batches, attachments and Turnip pass timings to its frame trace. Kernel event 63 identifies the render, encode and completion threads. In `iconservicesagent`, event 65 records the Metal device and queue, then up to eight completed command buffers containing draws or dispatches. Each work record includes the command buffer status and draw and dispatch counts. [GPU frame diagnostics](https://unixnu.com/porting/gpu-diagnostics)
 
 `wallpaper-freeze=1` enables wallpaper isolation. A Poster renderer freezes GPU submission after a successful command draws into and stores an IOSurface of at least two million pixels. The completed output stays retained. Later commands remain committed and unscheduled, with their resources and queue leases retained. Already submitted work completes normally. PosterBoard and other processes keep submitting. The switch defaults to off; `NATIVE_METAL_FREEZE_WALLPAPER=1` selects the same mode directly in a renderer process.
 
-`metal-flow=1` enables the runtime's lowering thread, commit submission and pipeline warm pass for testing. The switch defaults to off. Either value of `metal-flow=` logs the `FL` counts to os_log when they change.
+`metal-flow=3` is the macOS default: bit 0 selects the lowering thread and bit 1 submits ready commits from the committing thread. iPadOS defaults to 7, with bit 2 enabling the pipeline warm pass. A supplied `metal-flow=` value logs the `FL` counts to os_log when they change.
 
 Slow encoding operations retain source lines and enqueue times. Completion handlers and resource destructors carry individual timing and identities. Kernel sampling of the render, encode and completion threads and blocked-thread waits provide the cross-thread wait record.
+
+With `diag=1`, encoding batch end records (type 14, phase 3) store encoding-thread CPU microseconds in field `d`. Compare this with the paired start/end wall time to distinguish work from waits. The `TUC` telemetry row reports Turnip BO cache lookups, hits, inserts, evictions and full flushes.
 
 `python3 scripts/check-wallpaper-freeze-host.py` in the resolved tree checks real pixels, callbacks, concurrent parked submissions and process selection.
 

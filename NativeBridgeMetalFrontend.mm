@@ -167,6 +167,7 @@ static void (*gMissing)(const char *, const char *);
 // What this device has been asked and refused, for the plugin's status line (native_bridge_metal_status): commits, render/compute pipelines made,
 // refusals, and the last two refusals' texts. Counters only; nothing here changes a result.
 static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gCompleted,gWaitTimeouts;
+static std::atomic<uint64_t> gTrimmedBlocks;   // kept empty memory blocks freed (watchIdleMemory, watchImportPressure)
 // What the render server actually asks of the GPU (int-141: 59 commits in 200 s, and a desktop that behaves like CPU compositing): render passes,
 // draws, the pixels of their first colour attachment, compute dispatches, blits and the largest pass (pixels).
 static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses;
@@ -570,7 +571,10 @@ static bool logToStderr() {static bool on=getenv("NMB_LOG_STDERR")!=nullptr;retu
 static bool logGpuOn() {static const bool on=getenv("SHENG_LOG_GPU")!=nullptr;return on;}
 #define GLOG(...) do{if(logGpuOn()){NSString *glogText=[NSString stringWithFormat:__VA_ARGS__];\
  os_log(OS_LOG_DEFAULT,"%{public}s",glogText.UTF8String?:"?");}}while(0)
-#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];GLOG(@"%@",nbText);noteProblem(nbText);\
+// NBLOG lines (refusals and other problems, rare) stay in the unified log whatever log-gpu says, and public: NSLog(@"%@") stored
+// every line as <private>, so a refusal's reason was unreadable in a log archive.
+#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];os_log(OS_LOG_DEFAULT,"%{public}s",nbText.UTF8String?:"?");\
+ noteProblem(nbText);\
  if(logToStderr())fprintf(stderr,"%s: %.140s\n",getprogname(),nbText.UTF8String?:"?");}while(0)
 // The render server does not get past the loss of its GPU context: CoreAnimation keeps submitting to the dead context and
 // the display shows the surfaces it composed last until backboardd restarts (the hang's evidence is in the host's KGSL log
@@ -1375,11 +1379,12 @@ extern "C" uint64_t native_bridge_metal_purge(uint32_t cause,uint64_t idleMs) {
 extern "C" bool native_bridge_metal_purge_counts(uint64_t out[16]) {return gDevice && nmb_device_purge_counts(gDevice,out);}
 // What a memory pressure event gives back: the surface imports held between frames, what the caller declared discardable (first,
 // so the blocks it empties go with the rest), then the runtime's parked objects and its spare and kept empty blocks (bridge patches
-// 0021 and 0034), as Metal's resource cache gives memory back. The bytes discarded.
+// 0021 and 0034), as Metal's resource cache gives memory back. The bytes discarded. The runtime's kept empty blocks (the board's
+// metal2vulkan 0013) go first, all of them, whatever their age (watchIdleMemory trims those empty for two seconds).
 extern "C" uint64_t native_bridge_metal_relieve_memory(void) {
  trimHeldImports(true);
  const uint64_t discarded=native_bridge_metal_purge(0,0);
- if(gDevice)gPressureEvents[2]+=nmb_device_release_kept_memory(gDevice);
+ if(gDevice){gTrimmedBlocks+=nmb_device_trim_memory(gDevice,0);gPressureEvents[2]+=nmb_device_release_kept_memory(gDevice);}
  return discarded;
 }
 // Pressure events are rare on a system whose GPU memory is wired (one warning in the five boots of run61's log archive, with 3.1 of
@@ -1403,13 +1408,38 @@ static void watchImportPressure() {
  static dispatch_source_t source;
  dispatch_once(&once,^{
   source=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,
-   DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
+   DISPATCH_MEMORYPRESSURE_NORMAL|DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
   if(!source)return;
+  // The source fires as the level changes, not while it stays raised, and the room the runtime keeps ahead of its placements came
+  // back with the next frame: while the level is raised the runtime keeps none (the board's metal2vulkan 0020), until the source
+  // reports the normal level again. Every block is wired guest memory here; the render server kept 547-616 MiB of empty ones.
   dispatch_source_set_event_handler(source,^{
-   gPressureEvents[dispatch_source_get_data(source)&DISPATCH_MEMORYPRESSURE_CRITICAL?1:0]++;
+   const uintptr_t level=dispatch_source_get_data(source);
+   const bool raised=(level&(DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL))!=0;
+   if(gDevice)(void)nmb_device_hold_back_memory(gDevice,raised);
+   if(!raised)return;
+   gPressureEvents[level&DISPATCH_MEMORYPRESSURE_CRITICAL?1:0]++;
    native_bridge_metal_relieve_memory();
   });
   dispatch_activate(source);
+ });
+}
+// The runtime's kept empty memory blocks that have stayed empty for two seconds go, every two seconds, and all of them on memory
+// pressure (native_bridge_metal_relieve_memory): it keeps the last empty block of each memory pool for its next placements however
+// long it stays empty (its own aging, bridge patch 0034, lets only the blocks beyond one a pool go), and on this guest every block is
+// wired memory -- the render server held 72-136 MiB of them at the home screen, a wallpaper or widget renderer its own. A pool whose
+// placements come each frame refills its kept block within the frame, so only blocks no frame asked for in two seconds go. (Waiting
+// for the process to commit nothing for two seconds never trimmed the render server: the home screen's clock keeps it drawing.) The
+// timer is a static for the reason the pressure source is (a source whose last reference goes never fires again).
+static void watchIdleMemory() {
+ static dispatch_once_t once;
+ static dispatch_source_t timer;
+ dispatch_once(&once,^{
+  timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
+  if(!timer)return;
+  dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),2*NSEC_PER_SEC,250*NSEC_PER_MSEC);
+  dispatch_source_set_event_handler(timer,^{if(gDevice)gTrimmedBlocks+=nmb_device_trim_memory(gDevice,2000);});
+  dispatch_activate(timer);
  });
 }
 // The entry records the surface object the import itself retains, never the caller's: a hit may come with another object for the same
@@ -2772,6 +2802,29 @@ static thread_local EncodeBatch *tBatch;
 // samples during encoding calls of 30 ms or more were on a run queue. The first CoreAnimation thread that makes a command buffer is the
 // reference; a timeshare reference leaves the encoding thread as it is.
 static std::atomic<pthread_t> gEncodeReference{nullptr};
+// DroidVM (iPadOS 27): in the render server (isRenderServer: backboardd), and in any process while /private/var/ngpu/debug/encode-priority
+// exists, the thread runs round-robin at a fixed priority instead (the file's number; 54, CoreAnimation's frame-info and completion
+// threads', without one): backboardd clamps the user-interactive QoS to 37-46, below every app's and SpringBoard's main thread (47),
+// while CoreAnimation's display thread waits on it for each frame (render-server thread 55), and CoreAnimation's threads are not set
+// through pthread scheduling (copying the first caller's policy gave 31), so the reference above most likely leaves it as it is. As an app
+// opened, those main threads took the CPU and the encode thread sat runnable a quarter of the time (11-06). Same boot, alternating A/B,
+// 3 pairs of six transitions, the switch in every process: intervals over 33 ms per 100 frames 21/5/24/26/14 -> 7/2/3/7/5, but the app
+// switcher 3.6 -> 10.8, apps' encode threads above their own main threads -- so by default only the render server's, and on macOS
+// only with the file (WindowServer takes its render thread's policy as above). /private/var/ngpu/debug/no-encode-priority keeps the
+// QoS and the reference everywhere. Decided as the thread is made (the first batch), after the host has said whether this is the
+// render server.
+static bool encodePriorityWanted() {
+ if(access("/private/var/ngpu/debug/no-encode-priority",F_OK)==0)return false;
+ if(access("/private/var/ngpu/debug/encode-priority",F_OK)==0)return true;
+#if TARGET_OS_OSX
+ return false;
+#else
+ return isRenderServer();
+#endif
+}
+static bool gEncodePriority;
+static int gEncodePolicy=SCHED_RR;static sched_param gEncodeParam={};
+static std::atomic<int> gEncodePriorityStatus{-1};
 static void encodeAdoptReference() {
  static bool adopted=false;
  if(adopted)return;
@@ -2786,17 +2839,23 @@ static EncodeThread &encodeThread() {
  static EncodeThread *thread=[]{
   EncodeThread *t=new EncodeThread;
   pthread_t id;pthread_attr_t attr;pthread_attr_init(&attr);
-  pthread_attr_set_qos_class_np(&attr,QOS_CLASS_USER_INTERACTIVE,0);
+  gEncodePriority=encodePriorityWanted();
+  if(gEncodePriority) {
+   gEncodeParam.sched_priority=54;
+   if(FILE *f=fopen("/private/var/ngpu/debug/encode-priority","r")){int p=0;if(fscanf(f,"%d",&p)==1 && p>0 && p<128)gEncodeParam.sched_priority=p;fclose(f);}
+  } else pthread_attr_set_qos_class_np(&attr,QOS_CLASS_USER_INTERACTIVE,0);
   pthread_create(&id,&attr,[](void *arg)->void * {
    EncodeThread &t=*(EncodeThread *)arg;tOnEncodeThread=true;
    pthread_setname_np("native-metal-encode");traceThread(2);
+   if(gEncodePriority)gEncodePriorityStatus=pthread_setschedparam(pthread_self(),gEncodePolicy,&gEncodeParam);
    std::unique_lock<std::mutex> lock(t.lock);
    for(;;) {
     t.work.wait(lock,[&]{return !t.batches.empty();});
     EncodeBatch *batch=t.batches.front();t.batches.pop_front();
     const uint32_t depth=(uint32_t)t.batches.size(),tasks=(uint32_t)batch->count;
     lock.unlock();tEncodeBatchId=batch->serial;
-    encodeAdoptReference();
+    if(gEncodePriority){static bool said;if(!said){said=true;NBLOG(@"native-metal: encode thread policy %d priority %d: %d",gEncodePolicy,gEncodeParam.sched_priority,gEncodePriorityStatus.load());}}
+    else encodeAdoptReference();
     batchStage(batch->serial,2,batch->enqueuedUs,tasks,depth);
     @autoreleasepool {batch->run();}
     batchStage(batch->serial,3,batch->enqueuedUs,tasks,depth);tEncodeBatchId=0;
@@ -3364,7 +3423,7 @@ static uint64_t encodeCommandOf(id object) {
 }
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
- if(dumpRange().first)self.dumpPipeline=state;
+ if(dumpDescribes())self.dumpPipeline=state;
  noteFormats(self.passKey|((uint64_t)((NBRenderPipeline *)state).stateFormat<<32));
  if(gDrawStats)[self noteState:kDSPipeline key:0 object:(__bridge const void *)state value:0];
  ENCODE([self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"]);
@@ -5770,8 +5829,7 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
  }
  gTimePipeline.add(pipelineBegan);
  if(!handle) {
-  NBFunction *f=(NBFunction *)function;
-  noteProblem([NSString stringWithFormat:@"compute %@ k=%s: %@",f.name,f.constantsText.c_str(),lastError()]);
+  computeRefused(function,lastError());
   return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
  }
  if(reflection && wantsReflection(options)) {
@@ -5907,7 +5965,7 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
   return nil;
  }
  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;state.stateFormat=(uint32_t)d.colorAttachments[0].pixelFormat;gPipelines++;if(error)*error=nil;
- if(dumpRange().first)state.dumpInfo=renderDumpInfo(d);
+ if(dumpDescribes())state.dumpInfo=renderDumpInfo(d);
  return (id<MTLRenderPipelineState>)state;
 }
 // The asynchronous forms make the pipeline on the caller's thread and call the handler before returning, as the library's
@@ -6319,7 +6377,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
   nmb_gpu_diagnostic_hook(frameRuntime);
  }
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
- watchImportPressure();
+ watchImportPressure();watchIdleMemory();
  logFlowCounts();
  logClientWork();
  logClientMemory();
@@ -6542,6 +6600,65 @@ static unsigned threadCpuTop(ThreadCpu *top,unsigned max,uint64_t *totalUs,uint6
  for(unsigned i=0;i<n;i++)top[i]=used[i];
  return n;
 }
+// What this process's Metal calls hold against what the runtime holds for them, MiB, in one row of at most 63 characters (a client's
+// text row; the render server's telemetry too): "Ma" textures/count buffers/count heaps | the runtime's pooled blocks/placed in them,
+// empty kept blocks, dedicated blocks, host imports, Turnip's cache of freed BOs. What the kernel's blobs hold past all of it is
+// Turnip's own (command streams, shaders).
+extern "C" size_t nmb_memory_row(char *out,size_t size) {
+ if(!out || !size)return 0;
+ out[0]=0;
+ uint64_t mc[10]={};
+ if(!gDevice || !nmb_device_memory_counts(gDevice,mc))return 0;
+ uint64_t bc[8]={};
+ static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
+ static void (*cacheStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_darwin_bo_cache_stats"):nullptr;
+ if(cacheStats)cacheStats(bc);
+ auto mib=[](int64_t b){return (long long)(b>>20);};
+ // The heap past the GPU's: the runtime's (its counting allocator), every malloc zone's in use, and the process's footprint.
+ uint64_t heap[2]={};nmb_heap_counts(heap);
+ malloc_statistics_t zones={};malloc_zone_statistics(nullptr,&zones);
+ task_vm_info_data_t vm={};mach_msg_type_number_t vmCount=TASK_VM_INFO_COUNT;
+ const uint64_t footprint=task_info(mach_task_self(),TASK_VM_INFO,(task_info_t)&vm,&vmCount)==KERN_SUCCESS?vm.phys_footprint:0;
+ const int n=snprintf(out,size,"Ma t%lld/%lld b%lld/%lld h%lld|p%llu/%llu e%llu d%llu i%llu c%llu|r%llu/%lluk z%llu f%llu",
+  mib(gAskedBytes[0].load()),(long long)gAskedCount[0].load(),mib(gAskedBytes[1].load()),(long long)gAskedCount[1].load(),
+  mib(gAskedBytes[2].load()),(unsigned long long)(mc[0]>>20),(unsigned long long)(mc[1]>>20),(unsigned long long)(mc[2]>>20),
+  (unsigned long long)(mc[3]>>20),(unsigned long long)(mc[4]>>20),(unsigned long long)(bc[5]>>20),(unsigned long long)(heap[0]>>20),
+  (unsigned long long)(heap[1]>>10),(unsigned long long)(zones.size_in_use>>20),(unsigned long long)(footprint>>20));
+ return n>0?(size_t)n:0;
+}
+// The render pass instances this process's device began and why its passes split (the client memory file, startMemoryWriter).
+extern "C" size_t nmb_split_row(char *out,size_t size) {
+ if(!out || !size)return 0;
+ out[0]=0;
+ uint64_t c[13]={};
+ if(!gDevice || !nmb_device_split_counts(gDevice,c))return 0;
+ const int n=snprintf(out,size,"splits commits %llu (sched held %llu capped %llu) ins %llu inl %llu | bar %llu (unneeded %llu) tile %llu tmem %llu att %llu fb %llu ml %llu pend %llu exec %llu vis %llu shape %llu\n",
+  (unsigned long long)gCommits.load(),(unsigned long long)schedpace::gHeld.load(),(unsigned long long)schedpace::gCapped.load(),(unsigned long long)c[0],(unsigned long long)c[11],(unsigned long long)c[1],(unsigned long long)c[12],(unsigned long long)c[2],(unsigned long long)c[3],
+  (unsigned long long)c[4],(unsigned long long)c[5],(unsigned long long)c[6],(unsigned long long)c[7],(unsigned long long)c[8],
+  (unsigned long long)c[9],(unsigned long long)c[10]);
+ return n>0?(size_t)n:0;
+}
+// The `count` largest counted textures and buffers, one line each: MiB (two decimals), then a texture's size, format, levels, samples,
+// array length, usage and options, or a buffer's options (the client memory file, startMemoryWriter).
+extern "C" size_t nmb_memory_top(char *out,size_t size,unsigned count) {
+ if(!out || !size)return 0;
+ out[0]=0;
+ std::vector<AskedRecord> records;
+ {std::lock_guard<std::mutex> lock(gAskedLock);records.reserve(gAskedLive.size());for(auto &entry:gAskedLive)records.push_back(entry.second);}
+ std::sort(records.begin(),records.end(),[](const AskedRecord &a,const AskedRecord &b){return a.bytes>b.bytes;});
+ size_t at=0;
+ for(unsigned i=0;i<records.size() && i<count;i++) {
+  const AskedRecord &r=records[i];const NmbTextureDescriptor &t=r.texture;
+  const int n=r.isTexture?
+   snprintf(out+at,size-at,"tex %.2f %llux%llux%llu f%llu L%llu s%llu a%llu u%llx o%llx%s\n",r.bytes/1048576.0,(unsigned long long)t.width,
+    (unsigned long long)t.height,(unsigned long long)t.depth,(unsigned long long)t.format,(unsigned long long)t.levels,(unsigned long long)t.samples,
+    (unsigned long long)t.array_length,(unsigned long long)t.usage,(unsigned long long)t.options,t.framebuffer_only?" fbonly":""):
+   snprintf(out+at,size-at,"buf %.2f o%llx\n",r.bytes/1048576.0,(unsigned long long)t.options);
+  if(n<=0 || (size_t)n>=size-at)break;
+  at+=(size_t)n;
+ }
+ return at;
+}
 // The telemetry table the plugin streams to the kernel's log: newline-separated rows of at most 90 characters. The kernel keeps the
 // first 48 rows, so the rows come in the order of what a boot is read for: where the GPU memory is, what was compiled and what it
 // cost, which threads used the CPU, the last problems, then the frame work and the last command buffers.
@@ -6569,9 +6686,12 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   uint64_t mc[10]={},bc[8]={};
   if(cacheStats)cacheStats(bc);
   if(nmb_device_memory_counts(gDevice,mc)) {
-   row("MEM pool %llu(%llu) empty %llu ded %llu imp %llu alloc %llu | blk %llu/%llu gp %llu-%llu | tuc %llu/%llu n%llu/%llu",
+   // (tr: kept empty blocks trimmed, in place of the GPU pool blocks made and released, which stay 0 on this board: the row has 90 characters)
+   row("MEM pool %llu(%llu) empty %llu ded %llu imp %llu alloc %llu | blk %llu/%llu tr %llu | tuc %llu/%llu n%llu/%llu",
     (ull)(mc[0]>>20),(ull)(mc[1]>>20),(ull)(mc[2]>>20),(ull)(mc[3]>>20),(ull)(mc[4]>>20),(ull)(mc[5]>>20),(ull)mc[6],(ull)mc[7],
-    (ull)mc[8],(ull)mc[9],(ull)(bc[5]>>20),(ull)(bc[6]>>20),(ull)bc[2],(ull)bc[3]);
+    (ull)gTrimmedBlocks.load(),(ull)(bc[5]>>20),(ull)(bc[6]>>20),(ull)bc[2],(ull)bc[3]);
+   char asked[96];
+   if(nmb_memory_row(asked,sizeof asked))row("%s",asked);
   }
   // The same blocks by size (nmb_device_memory_kinds): how many of at most 16, 32, 40, 48, 56 and 64 MiB and of more, for the
   // pooled blocks in use and those kept empty (MK), the spare image blocks and the dedicated blocks of an image, with their MiB
@@ -6790,6 +6910,18 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(ull)gTimeSurfaceFlush.count.load(),
   (ull)gSurfaceFlushBytes.load(),(ull)gSurfaceFlushDuplicates.load(),
   (ull)gTimeSurfaceFlush.total.load(),(ull)gTimeSurfaceFlush.slowest.load());
+ if(gDevice) {
+  // What held the runtime's batches back from the GPU (nmb_device_scheduler_counts): heads held for a host step and of them at their
+  // gate (the GPU drained first), for an event value, behind an earlier commit; batches held and for how long; grouped submissions,
+  // their batches, groups kept pending and sent with nothing ready; then batches submitted with 0, 1, 2-3, 4+ earlier ones pending.
+  uint64_t qs[16]={};
+  if(nmb_device_scheduler_counts(gDevice,qs)) {
+   row("Q host %llu gate %llu ev %llu early %llu | held %llu %llums | grp %llu/%llu kept %llu idle %llu",(ull)qs[0],(ull)qs[1],
+    (ull)qs[2],(ull)qs[3],(ull)qs[4],(ull)(qs[5]/1000000),(ull)qs[6],(ull)qs[7],(ull)qs[8],(ull)qs[9]);
+   row("Q pending 0:%llu 1:%llu 2-3:%llu 4+:%llu | cb %llu gw %llu",(ull)qs[10],(ull)qs[11],(ull)qs[12],(ull)qs[13],(ull)qs[14],
+    (ull)qs[15]);
+  }
+ }
  row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(ull)gNoCopyAll.load(),(ull)gNoCopyReleased.load(),
   (ull)gNoCopyMade.load(),
   (ull)gSurfaceImportsReleased.load(),(ull)gSurfaceImportsMade.load());

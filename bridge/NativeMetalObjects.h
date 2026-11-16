@@ -73,6 +73,9 @@ bool nmb_device_flow_counts(const NmbDevice *, uint64_t out[8]);
 // Passes begun as instances, split inline; instance splits for a barrier, tile memory, a memoryless write, a pending pipeline; stand-ins
 // made and their bytes; stand-in copies made and those made at draws.
 bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
+// Render pass instances begun and why passes split into them (thirteen words: begun, barrier, tile dispatch, tile memory, attached read,
+// feedback, memoryless write, pending pipeline, execution, visibility, shape, begun inline, barriers that ordered no write).
+bool nmb_device_split_counts(const NmbDevice *, uint64_t *out);
 // Bytes of pooled blocks live and placed in them, empty kept, dedicated, host imports; bytes allocated so far; pooled and dedicated
 // blocks live; GPU pool blocks made and released.
 bool nmb_device_memory_counts(const NmbDevice *, uint64_t out[10]);
@@ -118,6 +121,9 @@ size_t nmb_heap_sites(uint64_t *out, size_t max);
 // No-copy ranges checked, and those whose pages had changed since a buffer was last made over them (reported to the runtime as remapped).
 bool nmb_no_copy_remaps(uint64_t out[2]);
 bool nmb_device_scheduler_counts(const NmbDevice *, uint64_t out[16]);
+uint32_t nmb_device_trim_memory(const NmbDevice *, uint32_t idle_ms);
+// While on, the runtime keeps no memory for later placements (the board's metal2vulkan 0020): on under memory pressure, off at normal.
+size_t nmb_device_hold_back_memory(const NmbDevice *, bool on);
 /* Artifact lookups and driver pipeline records are separate cache layers. */
 struct NmbShaderCacheStats {
     uint64_t hits, misses, rejected, read_failures, writes, write_failures, evictions;

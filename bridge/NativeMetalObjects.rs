@@ -883,6 +883,27 @@ pub extern "C" fn nmb_device_pass_counts(device: *const NmbDevice, out: *mut u64
     })
 }
 
+/// Render pass instances begun and why passes split into them, into the caller's thirteen words: instances begun, then splits for a
+/// barrier, a tile dispatch, tile memory, an attached read, a feedback loop, a memoryless write, a pending pipeline, an execution, a
+/// visibility mode and the shape, then passes begun inline, then memory barriers that ordered no write and split nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_split_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the caller's thirteen words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 13) };
+        let w = get(device)?.0.work_counts();
+        out.copy_from_slice(&[w.render_passes_begun_instances, w.instance_splits_barrier, w.instance_splits_tile_dispatch,
+                              w.instance_splits_tile_memory, w.instance_splits_attached_read, w.instance_splits_feedback,
+                              w.instance_splits_memoryless_write, w.instance_splits_pending_pipeline, w.instance_splits_execution,
+                              w.instance_splits_visibility, w.instance_splits_shape, w.render_passes_begun_inline,
+                              // the board's metal2vulkan 0034 counted memory barriers that split nothing; not carried to 555b13d5
+                              0]);
+        Ok(true)
+    })
+}
 
 /// Where the runtime's device memory is, into the caller's ten words: bytes of its pooled blocks with a placement and of those the
 /// bytes placed, of its empty kept pooled blocks, of its dedicated blocks (GPU pools, large resources) and of its host imports; then
@@ -1175,6 +1196,22 @@ pub extern "C" fn nmb_device_scheduler_counts(device: *const NmbDevice, out: *mu
     })
 }
 
+/// While `on`, the runtime keeps no memory for later placements -- no room ahead, no empty pooled block, no spare (the board's
+/// patches/metal2vulkan/0020): the frontend turns it on as the system reports memory pressure and off as the level is normal again,
+/// since the notification comes as the level changes and a one-time trim came back with the next frame's room. How many blocks
+/// went as it turned on.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_hold_back_memory(device: *const NmbDevice, on: bool) -> usize {
+    guard(0, || Ok(get(device)?.0.hold_back_memory(on)))
+}
+
+/// Frees the runtime's kept empty pooled blocks that have stayed empty for `idle_ms` or longer (0: all of them), answering how many
+/// went (the board's patches/metal2vulkan/0013-trim-kept-memory.patch): the frontend trims as its process idles and on memory pressure,
+/// since on a guest whose GPU imports its pages every block is wired memory the system cannot reclaim.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_trim_memory(device: *const NmbDevice, idle_ms: u32) -> u32 {
+    guard(0, || Ok(get(device)?.0.trim_kept_memory(std::time::Duration::from_millis(u64::from(idle_ms))) as u32))
+}
 
 
 /// Separate artifact and driver-record counters, mirroring the C ABI.

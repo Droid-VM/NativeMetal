@@ -35,6 +35,34 @@
 #include "CacheExport.h"
 #include "PrimeShaders.h"
 #include "ExceptionDiag.h"
+#include <atomic>
+
+#if !TARGET_OS_OSX
+// The kernel boot argument ca-triple-buffer=1 sets the render server's CA_FORCE_TRIPLE_BUFFERED_LATENCY, as Droid-VM/macOS-DroidVM's
+// plugin sets WindowServer's (macOS: the constructor of the same name below): CoreAnimation renders a frame ahead (a frame of
+// presentation latency) instead of starting each frame only after the last one's buffer came back, which it does whenever a frame
+// took longer than a refresh -- and a frame's GPU work returns 8-12 ms after its commit through a virtual GPU. The option's index is
+// found by its name (CAGetDebugOptionEnvVariableName; 200 in iPadOS 27's QuartzCore, 198 in macOS 27's), so a QuartzCore that numbers
+// its options otherwise is not given another one.
+__attribute__((constructor)) static void tripleBufferFromBootArgs() {
+    char args[1024] = {};
+    size_t size = sizeof(args) - 1;
+    if (strcmp(getprogname(), "backboardd") || sysctlbyname("kern.bootargs", args, &size, nullptr, 0) || !strstr(args, "ca-triple-buffer=1"))
+        return;
+    auto name = reinterpret_cast<const char *(*)(unsigned)>(dlsym(RTLD_DEFAULT, "CAGetDebugOptionEnvVariableName"));
+    auto setOption = reinterpret_cast<void (*)(unsigned, bool)>(dlsym(RTLD_DEFAULT, "CASetDebugOption"));
+    setenv("CA_FORCE_TRIPLE_BUFFERED_LATENCY", "1", 1);   // for an options read after this one
+    if (!name || !setOption) return;
+    for (unsigned option = 0; option < 1024; ++option) {
+        const char *text = name(option);
+        if (text && !strcmp(text, "CA_FORCE_TRIPLE_BUFFERED_LATENCY")) {
+            setOption(option, true);
+            fprintf(stderr, "NativeAdrenoMetal: CA_FORCE_TRIPLE_BUFFERED_LATENCY (option %u) set\n", option);
+            return;
+        }
+    }
+}
+#endif
 
 #if TARGET_OS_OSX
 #include "IOGPUMetalDeviceShim.h"
@@ -214,6 +242,101 @@ static void clientFailure(unsigned port, const char *step, const char *detail) {
             }
     }
 }
+// Diagnostic: while /private/var/ngpu/debug/client-mem exists when a process opens its device (the render server too), the process
+// writes every 5 s to m2v-mem.txt in its temporary directory, renamed into place whole: "<name> <pid> <unix time> <row>" (its memory
+// row, nmb_memory_row: what its Metal calls hold against what the runtime holds), its largest resources (nmb_memory_top), then the
+// runtime's placements by the source line that asked for them (m2v_placement_sites) and its pools' blocks (m2v_pool_report). The
+// kernel's per-client text rows hold 8 processes, and a wallpaper extension came after them.
+extern "C" size_t nmb_memory_row(char *out, size_t size) __attribute__((weak));
+extern "C" size_t nmb_memory_top(char *out, size_t size, unsigned count) __attribute__((weak));
+extern "C" size_t nmb_split_row(char *out, size_t size) __attribute__((weak));
+// The runtime's live placements by the source line that asked for them (the board's patches/metal2vulkan/0028).
+extern "C" size_t m2v_placement_sites(uint8_t *out, size_t size) __attribute__((weak));
+// Its pools' blocks: size, used, free ranges, longest free range (0031).
+extern "C" size_t m2v_pool_report(uint8_t *out, size_t size) __attribute__((weak));
+// The bridge's sampled heap sites (its counting allocator): turned on here, then "heap MiB samples frames" lines, a frame +offset in
+// the plugin (its link map names it) or *offset in another image.
+extern "C" void nmb_heap_sampling(void) __attribute__((weak));
+extern "C" size_t nmb_heap_sites(uint64_t *out, size_t max) __attribute__((weak));
+static void writeHeapSites(FILE *file) {
+    if (!&nmb_heap_sites) return;
+    static uint64_t sites[64 * 14];
+    const size_t n = nmb_heap_sites(sites, 64);
+    static Dl_info self = {};
+    static const bool selfFound = dladdr((const void *)&nmb_heap_sites, &self);
+    for (size_t i = 0; i < n; ++i) {
+        const uint64_t *site = sites + i * 14;
+        fprintf(file, "heap %.2f %llu", site[0] / 1048576.0, (unsigned long long)site[1]);
+        for (unsigned f = 0; f < 12 && site[2 + f]; ++f) {
+            Dl_info info = {};
+            const bool found = dladdr((const void *)site[2 + f], &info) && info.dli_fbase;
+            const bool mine = found && selfFound && info.dli_fbase == self.dli_fbase;
+            fprintf(file, " %c%llx", mine ? '+' : '*', (unsigned long long)(found ? site[2 + f] - (uint64_t)info.dli_fbase : site[2 + f]));
+        }
+        fputc('\n', file);
+    }
+}
+static void startMemoryWriter() {
+    if (!&nmb_memory_row || access("/private/var/ngpu/debug/client-mem", F_OK) != 0) return;
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    char dir[512];
+    if (!confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir - 32)) return;
+    std::string path = std::string(dir) + "m2v-mem.txt", partial = path + ".new";
+    if (&nmb_heap_sampling) nmb_heap_sampling();
+    std::thread([path, partial]{
+        pthread_setname_np("memory-writer");
+        for (;;) {
+            char row[128];
+            if (nmb_memory_row(row, sizeof row) && row[0])
+                if (FILE *file = fopen(partial.c_str(), "w")) {
+                    fprintf(file, "%s %d %ld %s\n", getprogname(), getpid(), (long)time(nullptr), row);
+                    // Then the 24 largest textures and buffers its Metal calls hold.
+                    static char top[4096];
+                    if (&nmb_memory_top && nmb_memory_top(top, sizeof top, 24)) fputs(top, file);
+                    // Then where the runtime's own placements came from (shadows, twins, staging): "site MiB count file:line".
+                    if (&m2v_placement_sites && m2v_placement_sites(reinterpret_cast<uint8_t *>(top), sizeof top)) fputs(top, file);
+                    if (&m2v_pool_report && m2v_pool_report(reinterpret_cast<uint8_t *>(top), sizeof top)) fputs(top, file);
+                    if (&nmb_split_row && nmb_split_row(top, sizeof top)) fputs(top, file);
+                    writeHeapSites(file);
+                    fclose(file);
+                    rename(partial.c_str(), path.c_str());
+                }
+            sleep(5);
+        }
+    }).detach();
+}
+// The runtime's pooled block size for a test, from /private/var/ngpu/debug/block-mib (the board's patches/metal2vulkan/0019; 64 MiB, the
+// runtime's own, without it). Every block is wired guest memory here, but 16 MiB blocks hung the render server's GPU context on 3 of 5
+// app open/close cycles (0 of 5 at 64: more images take dedicated blocks and spares), so smaller blocks stay a test.
+static void boundPooledBlocks() {
+    char text[16] = {};
+    if (FILE *file = fopen("/private/var/ngpu/debug/block-mib", "r")) {
+        if (!fgets(text, sizeof text, file)) text[0] = 0;
+        fclose(file);
+    }
+    if (text[0]) setenv("METAL2VULKAN_BLOCK_MIB", text, 0);
+}
+// A client's cache of freed BOs (Turnip's darwin backend: TU_DARWIN_BO_CACHE_MB, 96 by default, and TU_DARWIN_BO_CACHE_SMALL_MB for BOs
+// of at most 1 MiB, 16): 16 and 8 MiB in every process but the render server, which keeps the defaults. Every BO is wired guest memory
+// and each resident client kept its cache full: the wallpaper extension held 56 MiB of freed BOs for a still picture, widgets and
+// SpringBoard 30-40 MiB each. A test's sizes from /private/var/ngpu/debug/client-bo-cache-mb ("BIG SMALL" in MiB; a BIG of 0 is no
+// limit, as Turnip reads it).
+static void boundClientBoCache() {
+    unsigned big = 16, small = 8;
+    if (FILE *file = fopen("/private/var/ngpu/debug/client-bo-cache-mb", "r")) {
+        unsigned b = 0, s = 0;
+        const int n = fscanf(file, "%u %u", &b, &s);
+        if (n >= 1) big = b;
+        if (n >= 2) small = s;
+        fclose(file);
+    }
+    char text[16];
+    snprintf(text, sizeof text, "%u", big);
+    setenv("TU_DARWIN_BO_CACHE_MB", text, 0);
+    snprintf(text, sizeof text, "%u", small);
+    setenv("TU_DARWIN_BO_CACHE_SMALL_MB", text, 0);
+}
 static id clientDevice(unsigned port) {
     char turnip[1024];
     if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) {clientFailure(port, "no-turnip", ""); return nil;}
@@ -224,6 +347,8 @@ static id clientDevice(unsigned port) {
     }
     // IOSurfaces this GPU reads or writes must be plain rows, as in the render server.
     CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+    boundPooledBlocks();
+    boundClientBoCache();
     char candidates[3][512] = {};
     if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
     if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
@@ -268,6 +393,7 @@ static id clientDevice(unsigned port) {
     // once-a-second reader never ran before the crash (i568).
     if (device) {
         gClientPort = port;
+        startMemoryWriter();
         native_bridge_metal_problem_hook = [](const char *problem) {clientFailure(gClientPort, "problem", problem);};
         char problem[200] = {};
         if (native_bridge_metal_first_problem(problem, sizeof problem) && problem[0]) clientFailure(port, "problem", problem);
@@ -317,6 +443,19 @@ static id deviceForPort(unsigned port) {
         if (tried) return device;
         tried = true;
         exceptiondiag::start(); // the throw site of an uncaught exception, for the kernel's THROW row (ExceptionDiag.h)
+        // Experiments without a rebuild: each NAME=VALUE line of /private/var/ngpu/debug/env goes into this process's environment
+        // (Turnip's driconf options answer to their names there, tu_dont_care_as_load=true for one), before the defaults below.
+        if (FILE *vars = fopen("/private/var/ngpu/debug/env", "r")) {
+            char line[256];
+            while (fgets(line, sizeof line, vars)) {
+                line[strcspn(line, "\r\n")] = 0;
+                char *equals = strchr(line, '=');
+                if (!equals || equals == line || line[0] == '#') continue;
+                *equals = 0;
+                setenv(line, equals + 1, 1);
+            }
+            fclose(vars);
+        }
         // /private/var/ngpu/tu_debug, when present, holds TU_DEBUG for every Metal process (the boot argument tu-debug= comes after it).
         if (FILE *flags = fopen("/private/var/ngpu/tu_debug", "r")) {
             char line[128] = {};
@@ -352,6 +491,11 @@ static id deviceForPort(unsigned port) {
         // by Mesa's option parser): with it the BV thread bins a pass while BR still renders the one before. tu-cb=1 turns it on.
         // It stays at Mesa's default, off: what it gains here was never measured.
         if (bootArgSet("tu-cb=1")) setenv("tu_allow_concurrent_binning", "true", 0);
+        // The render server keeps the autotuner like every other process. For a day (2026-11-12) DroidVM's rendered in system memory:
+        // its tile memory (GMEM) passes left a zeroed 1536x2400 rectangle and displaced 32x8 blocks in one of the display's two
+        // framebuffers, which showed on every other frame. That was not Turnip's doing: the host had put this guest's compositor
+        // queue in the KGSL ringbuffer of Android's own UI at another priority, whose work came in between the pass's bins
+        // (virglrenderer drm2kgsl, kgsl_priority_flags). /private/var/ngpu/tu_debug and tu-debug= above still replace this.
         // diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
         if (bootArgSet("diag=1") || bootArgSet("gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
@@ -389,6 +533,47 @@ static id deviceForPort(unsigned port) {
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
         if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
         else unsetenv("SHENG_LOG_GPU");
+        // Diagnostic: while /private/var/ngpu/debug/mesa-log exists when the process opens its device, Mesa's log -- Turnip's reason
+        // for a lost device among it -- goes to mesa.log in the process's temporary directory instead of the stderr no reader of a
+        // daemon's sees, and a lost device aborts the process where Turnip declares it, so the crash report names the place.
+        if (access("/private/var/ngpu/debug/mesa-log", F_OK) == 0) {
+            char log[512];
+            if (confstr(_CS_DARWIN_USER_TEMP_DIR, log, sizeof log - 16)) {strlcat(log, "mesa.log", sizeof log); setenv("MESA_LOG_FILE", log, 1);}
+            setenv("MESA_VK_ABORT_ON_DEVICE_LOSS", "1", 1);
+        }
+        // Diagnostic: while /private/var/ngpu/debug/gpu-traces exists when the process opens its device, Turnip's u_trace writes the
+        // GPU's own timestamps around each render pass and its stages (binning, each tile's loads and stores, sysmem clears, blits)
+        // to gpu-traces.log in the process's temporary directory (MESA_GPU_TRACES=print): where a frame's GPU time goes, measured
+        // rather than inferred (a 2048x2732 frame took 5-6 ms of GPU time whatever the GPU clock).
+        if (access("/private/var/ngpu/debug/gpu-traces", F_OK) == 0) {
+            char path[512];
+            if (confstr(_CS_DARWIN_USER_TEMP_DIR, path, sizeof path - 16)) {strlcat(path, "gpu-traces.log", sizeof path); setenv("MESA_GPU_TRACEFILE", path, 1);}
+            setenv("MESA_GPU_TRACES", "print", 1);
+        }
+        // A/B: while /private/var/ngpu/debug/no-inline-memoryless exists when the process opens its device, a render pass with a
+        // memoryless color records its first instance in a secondary (fork patches/metal2vulkan/0014, METAL2VULKAN_INLINE_MEMORYLESS=0),
+        // so a later draw that writes the color no longer splits the pass: Core Animation's 2048x2732 frame passes split so at almost
+        // every frame (the PS row's ml), storing and loading the whole frame again on the tiler.
+        if (access("/private/var/ngpu/debug/no-inline-memoryless", F_OK) == 0) setenv("METAL2VULKAN_INLINE_MEMORYLESS", "0", 1);
+        // A/B: while /private/var/ngpu/debug/bo-cache-unsplit exists when the process opens its device, Turnip's freed-BO cache keeps
+        // every BO in one budget, as before the fork's patches/mesa/turnip-darwin-bo-cache-small-budget.patch (TU_DARWIN_BO_CACHE_SMALL_MB=0).
+        if (access("/private/var/ngpu/debug/bo-cache-unsplit", F_OK) == 0) setenv("TU_DARWIN_BO_CACHE_SMALL_MB", "0", 1);
+        // A/B: /private/var/ngpu/debug/keep-room-mib, read when the process opens its device: the most room the runtime keeps in
+        // each of its pools for its encodings (the board's patches/metal2vulkan/0027, METAL2VULKAN_KEEP_ROOM_MIB), half a block
+        // without it. The room is one free range: the render server's pooled blocks were half empty.
+        if (FILE *file = fopen("/private/var/ngpu/debug/keep-room-mib", "r")) {
+            char text[16] = {};
+            if (fgets(text, sizeof text, file) && text[0] >= '0' && text[0] <= '9') setenv("METAL2VULKAN_KEEP_ROOM_MIB", text, 1);
+            fclose(file);
+        }
+        // A/B: while /private/var/ngpu/debug/no-backing-cover exists when the process opens its device, each memoryless color
+        // backing serves only its own extent (the board's patches/metal2vulkan/0029 off, METAL2VULKAN_BACKING_COVER=0).
+        if (access("/private/var/ngpu/debug/no-backing-cover", F_OK) == 0) setenv("METAL2VULKAN_BACKING_COVER", "0", 1);
+        // A/B: while /private/var/ngpu/debug/no-lazy-bos exists when the process opens its device, Turnip offers no lazily allocated
+        // memory (the board's patches/mesa/turnip-darwin-lazy-bos.patch off): memoryless textures take memory of their own again.
+        if (access("/private/var/ngpu/debug/no-lazy-bos", F_OK) == 0) setenv("TU_DARWIN_LAZY_BOS", "0", 1);
+        // With the memory writer (client-mem, startMemoryWriter) the runtime keeps a report of its pools' blocks too (0031).
+        if (access("/private/var/ngpu/debug/client-mem", F_OK) == 0) setenv("METAL2VULKAN_POOL_REPORT", "1", 1);
 #if TARGET_OS_OSX
         // macOS: Turnip opens the accelerator by class (AGXAccelerator here); the display takes plain rows (no Apple framebuffer or IOSurface
         // compression). The runtime keeps its default block size: the virtual-machine board shrank it for a 512 MiB GPU pool, which this
@@ -411,6 +596,9 @@ static id deviceForPort(unsigned port) {
 #else
         if (!nativeIsRenderServer()) return device = clientDevice(port);
 #endif
+        // From here the process is the render server: the frontend's policies for it (the encode thread's priority, ending it
+        // after a GPU loss) follow this, not the process's name.
+        native_bridge_metal_set_render_server(true);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
             if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);
@@ -477,6 +665,14 @@ static id deviceForPort(unsigned port) {
             gpu->mark(writeTask(0x1e7021104 + slide, &never, sizeof never) ? 0x6E02 : 0x6EF2);
             const uint8_t off = 0;
             gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
+            // CADeviceIsVirtualized: framebuffer_pixel_format takes RGhA on a virtual device. QuartzCore asks MobileGestalt's
+            // IsVirtualDevice once (sub_184541f10 stores the answer at 0x1e701bdd9, its dispatch_once token at 0x1e7020780) and the
+            // answer is the board's vmm-present (i623fa0abd read IsVirtualDevice = 1). The board keeps vmm-present for AMFI, and
+            // telling every process the tablet is real hardware crashed backboardd on its first start three times (i1d2e5eab6), so
+            // only QuartzCore's answer is held at 0: the stored byte, then the token marked done, so the query never runs.
+            const int64_t onceDone = -1;
+            gpu->mark(writeTask(0x1e701bdd9 + slide, &off, sizeof off) && writeTask(0x1e7020780 + slide, &onceDone, sizeof onceDone) &&
+                      writeTask(0x1e701bdd9 + slide, &off, sizeof off) ? 0x6E04 : 0x6EF4);
             if (!strcmp(getprogname(), "backboardd") && bootArgSet("fb-bgra=1")) gpu->mark(patchFramebufferBranch(0x184461928 + slide));
             // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
             // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
@@ -519,6 +715,7 @@ static id deviceForPort(unsigned port) {
         // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums
         // (diag=1).
         unsetenv("METAL2VULKAN_LOG_PIPELINES");
+        boundPooledBlocks();
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         char candidates[7][512] = {};
@@ -576,6 +773,7 @@ static id deviceForPort(unsigned port) {
             return nil;
         }
         gpu->mark(0x6802);
+        startMemoryWriter();
         // The display hand-off client on its own thread: it only serves, not the discovery.
         pthread_t scanout;
         pthread_attr_t attributes;

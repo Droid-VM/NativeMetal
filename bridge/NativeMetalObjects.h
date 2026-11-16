@@ -48,24 +48,64 @@ bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
  * rejected, read failures, writes, writes queued, writes on a calling thread, bytes written, queued hits, write failures, evictions, driver cache loads,
  * driver pipeline hits, driver pipeline misses, driver saves, then three spare zeros. */
 bool nmb_device_shader_cache_detail(const NmbDevice *, uint64_t out[24]);
+/* The read-only system cache layer of the device opened after this call: the directory at root, read only where it, every directory
+ * on the way to an entry and the entry are owned by one of the count user ids and not writable by group or others, never through a
+ * link. A device asks its own cache directory first and the layer for what that lacks. False with nmb_last_error where the directory
+ * fails the test (no layer then); a null root names none. */
+bool nmb_system_cache_open(const char *root, const uint32_t *owners, size_t count);
+/* The cache directory of the device opened after this call makes its directories and entries readable by everyone (0755, 0644):
+ * the process that fills the system layer through its own directory. */
+void nmb_cache_readable_by_all(bool on);
+/* Entries read from the system layer and accepted, entries whose contents were refused, levels refused for kind, owner or mode,
+ * bytes of the accepted entries. False without a layer. */
+bool nmb_system_cache_counts(uint64_t out[4]);
+/* A file under the system layer by the layer's rules, at most limit bytes: a malloc block the caller frees, or null. The caller
+ * checks the contents and reports its verdict. */
+uint8_t *nmb_system_cache_read(const char *relative, uint64_t limit, size_t *length);
+void nmb_system_cache_verdict(bool accepted, uint64_t bytes);
 /* The translator source the runtime was built from, which keys the shader cache (build-native-metal-bridge.py). */
 const char *nmb_runtime_build(void);
 // Linear images made/refused/refused again, shadowed textures, shadow copies, texels copied back, linear passes in place/through copies.
 bool nmb_device_texture_counts(const NmbDevice *, uint64_t out[8]);
+// Records warmed, failed and unread, driver bytes the warm pass added; scheduler passes and batches submitted on the committing thread;
+// render log waits, and encoder ends the lowering thread lowered.
+bool nmb_device_flow_counts(const NmbDevice *, uint64_t out[8]);
 // Passes begun as instances, split inline; instance splits for a barrier, tile memory, a memoryless write, a pending pipeline; stand-ins
 // made and their bytes; stand-in copies made and those made at draws.
 bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
-// Render pass instances begun and why passes split into them (thirteen words: begun, barrier, tile dispatch, tile memory, attached read,
-// feedback, memoryless write, pending pipeline, execution, visibility, shape, begun inline, barriers that ordered no write).
-bool nmb_device_split_counts(const NmbDevice *, uint64_t *out);
 // Bytes of pooled blocks live and placed in them, empty kept, dedicated, host imports; bytes allocated so far; pooled and dedicated
 // blocks live; GPU pool blocks made and released.
 bool nmb_device_memory_counts(const NmbDevice *, uint64_t out[10]);
+// Live blocks of the runtime's own device memory (bridge patch 0031): seven size classes each (at most 16, 32, 40, 48, 56, 64 MiB,
+// larger) of pooled blocks with a placement [0], pooled blocks kept empty [7], spare image blocks [14], dedicated blocks of an image
+// [21] and of a buffer [28]; bytes of the spare blocks [35] and of the dedicated blocks of images [36] and buffers [37]; lazily
+// allocated blocks with a placement [38] and kept without one [42], each as blocks, bytes, blocks the driver committed, bytes it
+// committed; buffers' own imported pages as blocks and bytes [46].
+bool nmb_device_memory_kinds(const NmbDevice *, uint64_t out[48]);
+// VkPipelines the pipeline states' variants made, of them made at a state's creation and how many of those a draw or dispatch took,
+// those made at a draw or dispatch by a host step; nanoseconds inside the driver's graphics and compute pipeline makings; functions
+// translated and shader modules made.
+bool nmb_device_pipeline_counts(const NmbDevice *, uint64_t out[8]);
 /* The runtime's command buffer stages from sequence from on (bridge patch 0022): 24-byte records {u64 uptime ns, u64 id, u32 sequence,
  * u16 stage, u16 arg}; returns how many, *next the sequence to ask for next. */
 size_t nmb_stage_ring_read(uint64_t from, void *out, size_t max, uint64_t *next);
 /* Frees the runtime's spare dedicated blocks and kept empty pooled blocks (memory pressure); returns how many went. */
 size_t nmb_device_release_kept_memory(const NmbDevice *);
+/* Purgeable memory (NativeMetalPurge.rs). A buffer or texture the device made of its own memory, or a heap, whose state is Volatile or
+ * Empty is discarded while nothing uses it: no command buffer that named it is recording or in flight (the holds below), nothing made
+ * of it lives (a view, a texture over it, a resource placed in it), neither its CPU pointer nor its GPU address was handed out, and no
+ * call is inside it. Its handle stays valid: NonVolatile places it again and answers Empty, and any other use of it places it again
+ * with zeroed memory. NATIVE_METAL_PURGE=0 in the environment when the device opens discards nothing.
+ * nmb_device_purge: cause 0 (memory pressure) discards every such resource, cause 1 (age) those idle for idle_ms; the bytes discarded.
+ * nmb_device_purge_pending: the resources a later call may still discard. nmb_purge_age_ms: the age to pass (the runtime's spare
+ * block age). nmb_device_purge_counts, sixteen words: resources and bytes discarded by pressure, then by age; resources and bytes
+ * placed again by a NonVolatile request, then by another use; Empty answers for discarded contents; bytes discarded now; bytes that
+ * became Volatile or Empty so far and those of them never discardable (pointer or address handed out); the bytes the last call left
+ * because they were in use, tied to what was made of them, or not idle long enough; placements again that failed. */
+uint64_t nmb_device_purge(const NmbDevice *, uint32_t cause, uint64_t idle_ms);
+uint64_t nmb_device_purge_pending(const NmbDevice *);
+uint64_t nmb_purge_age_ms(void);
+bool nmb_device_purge_counts(const NmbDevice *, uint64_t out[16]);
 // Call stacks that allocated device memory of 4 MiB or more, most bytes first: records of twelve words (bytes, allocations, ten return
 // addresses); returns how many were written, at most max.
 size_t nmb_allocation_sites(uint64_t *out, size_t max);
@@ -78,9 +118,6 @@ size_t nmb_heap_sites(uint64_t *out, size_t max);
 // No-copy ranges checked, and those whose pages had changed since a buffer was last made over them (reported to the runtime as remapped).
 bool nmb_no_copy_remaps(uint64_t out[2]);
 bool nmb_device_scheduler_counts(const NmbDevice *, uint64_t out[16]);
-uint32_t nmb_device_trim_memory(const NmbDevice *, uint32_t idle_ms);
-// While on, the runtime keeps no memory for later placements (the board's metal2vulkan 0020): on under memory pressure, off at normal.
-size_t nmb_device_hold_back_memory(const NmbDevice *, bool on);
 /* Artifact lookups and driver pipeline records are separate cache layers. */
 struct NmbShaderCacheStats {
     uint64_t hits, misses, rejected, read_failures, writes, write_failures, evictions;
@@ -100,6 +137,9 @@ size_t nmb_device_family_blockers(const NmbDevice *, int64_t family, char *out, 
 
 /* Argument encoders (MTLArgumentEncoder): each argument is 8 bytes, written through the argument buffer's mapping at once. */
 typedef struct NmbArgumentEncoder NmbArgumentEncoder;
+typedef struct NmbBufferBinding NmbBufferBinding;
+NmbArgumentEncoder *nmb_buffer_binding_argument_encoder(const NmbDevice *, const NmbBufferBinding *);
+void nmb_buffer_binding_release(NmbBufferBinding *);
 typedef struct {
     uint32_t data_type, index, array_length, access, texture_type, constant_block_alignment;   /* raw Metal values */
 } NmbArgumentDescriptor;
@@ -135,13 +175,21 @@ NmbBuffer *nmb_buffer_new_no_copy(NmbDevice *, void *pointer, uint64_t length, u
 NmbBuffer *nmb_buffer_new_no_copy_releasing(NmbDevice *, void *pointer, uint64_t length, uint64_t options,
                                             void (*release)(void *context, void *pointer, uint64_t length), void *context);
 void nmb_buffer_release(NmbBuffer *);
+/* The CPU pointer and the GPU address are the buffer's for its life: once either is handed out the buffer is never discarded. */
 void *nmb_buffer_contents(const NmbBuffer *);
 uint64_t nmb_buffer_length(const NmbBuffer *);
 uint64_t nmb_buffer_gpu_address(const NmbBuffer *);
+/* A command buffer names the resource from the hold until the unhold (its completion, or its release without a commit): the
+ * resource is not discarded meanwhile. The hold comes before the command that names the resource is encoded. It answers true where
+ * the resource is discarded at that moment: its caller names it without having set it NonVolatile first, and the command will find
+ * it placed again, emptied. */
+bool nmb_buffer_hold(const NmbBuffer *);
+void nmb_buffer_unhold(const NmbBuffer *);
 
 struct NmbTextureDescriptor {
     uint64_t type, format, width, height, depth, levels, samples, array_length, usage, options;
     uint64_t rotation, framebuffer_only, is_drawable;
+    uint64_t swizzle; /* RGBA bytes, bit 32 marks an explicit value; zero means identity */
 };
 /* Heaps: type 0 automatic / 1 placement; offset UINT64_MAX asks an automatic heap to place the resource. */
 NmbHeap *nmb_heap_new(NmbDevice *, uint64_t type, uint64_t size, uint64_t options);
@@ -162,15 +210,34 @@ NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescri
 NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row,
                                        uint32_t pixel_format, uint64_t plane, uint64_t width, uint64_t height, uint64_t chroma_offset,
                                        uint64_t chroma_bytes_per_row);
+/* Two-plane YCbCr surface textures: made over their planes alone, made with their converted image, images made later at a slot
+   binding, textures over their planes another call made whole, converted images alive and their bytes; then textures whose planes
+   are read in place and those that keep their image alone by reason (device, layout, swizzle, offset, elements, reach, view). */
+bool nmb_ycbcr_surface_counts(const NmbDevice *, uint64_t out[14]);
 NmbTexture *nmb_texture_new_linear(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image);
 /* whole: a view of every level and slice as format; else levels and slices are {start, count} and kind the view's texture type. */
 NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], bool whole);
-/* swizzle: MTLTextureSwizzleChannels' four bytes, red in the lowest. */
-NmbTexture *nmb_texture_new_view_swizzle(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2],
-                                         uint32_t swizzle);
-/* setPurgeableState: with Metal's raw state; the answer's raw state, 0 where it fails. */
+/* setPurgeableState: with Metal's raw state; the answer's raw state, 0 where it fails. A discarded resource answers Empty: to
+ * NonVolatile after it is placed again, to a query and to Volatile without being placed. Bit 8 (NMB_PURGE_AGAIN_FAILED) is set where
+ * placing it again failed: the low byte is still Empty, the reason is nmb_last_error, and the next use tries again. The heap's
+ * nmb_heap_set_purgeable_state answers the same way. */
+#define NMB_PURGE_AGAIN_FAILED 0x100ull
 uint64_t nmb_texture_set_purgeable_state(const NmbTexture *, uint64_t state);
 uint64_t nmb_buffer_set_purgeable_state(const NmbBuffer *, uint64_t state);
+bool nmb_texture_hold(const NmbTexture *);
+void nmb_texture_unhold(const NmbTexture *);
+uint64_t nmb_texture_allocated_size(const NmbTexture *);
+uint64_t nmb_device_current_allocated_size(const NmbDevice *);
+bool nmb_texture_make_aliasable(const NmbTexture *);
+bool nmb_texture_is_aliasable(const NmbTexture *);
+bool nmb_buffer_make_aliasable(const NmbBuffer *);
+bool nmb_buffer_is_aliasable(const NmbBuffer *);
+NmbTexture *nmb_texture_new_view_swizzle(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], uint64_t swizzle);
+uint32_t nmb_function_constant_count(const NmbFunction *);
+size_t nmb_function_constant_name_size(const NmbFunction *, uint32_t at);
+bool nmb_function_constant_at(const NmbFunction *, uint32_t at, char *name, size_t capacity, uint64_t *index, uint64_t *data_type, bool *required);
+bool nmb_render_set_viewports(NmbEncoder *, const double *values, size_t count);
+bool nmb_render_set_scissors(NmbEncoder *, const uint64_t *values, size_t count);
 void nmb_texture_release(NmbTexture *);
 void nmb_texture_describe(const NmbTexture *, struct NmbTextureDescriptor *out);
 bool nmb_texture_replace(NmbTexture *, const uint64_t region[6], uint64_t level, uint64_t slice, const void *bytes, uint64_t bytes_per_row,
@@ -265,9 +332,12 @@ void nmb_render_pipeline_release(NmbRenderPipeline *);
 // A pipeline's reflection, as its creation's `reflection:` answers it, in JSON: {"vertex":[...],"fragment":[...]} for a render pipeline,
 // {"bindings":[...]} for a compute pipeline; each binding has Metal's raw values and a buffer's nested struct/array/pointer types. Null: refused.
 typedef struct NmbReflection NmbReflection;
+/* MTLFunction.functionConstantsDictionary: name, type, index and required for each constant. */
+NmbReflection *nmb_function_constants(const NmbFunction *);
 NmbReflection *nmb_render_pipeline_reflection(const struct NmbRenderPipelineDescriptor *);
 NmbReflection *nmb_compute_pipeline_reflection(const struct NmbComputePipelineDescriptor *);
 const char *nmb_reflection_json(const NmbReflection *);
+NmbBufferBinding *nmb_reflection_buffer_binding(const NmbReflection *, uint32_t stage, uint32_t index);
 void nmb_reflection_release(NmbReflection *);
 
 struct NmbSamplerDescriptor {
@@ -283,6 +353,7 @@ NmbDepthStencil *nmb_depth_stencil_new(NmbDevice *, const struct NmbDepthStencil
 void nmb_depth_stencil_release(NmbDepthStencil *);
 
 NmbQueue *nmb_queue_new(NmbDevice *);
+NmbQueue *nmb_queue_new_with_max_command_buffer_count(NmbDevice *, size_t);
 void nmb_queue_release(NmbQueue *);
 NmbCommandBuffer *nmb_command_buffer_new(NmbQueue *);
 void nmb_command_buffer_release(NmbCommandBuffer *);
@@ -388,6 +459,7 @@ struct NmbRenderPassDescriptor {
     struct NmbPassAttachment colors[8], depth, stencil;
     uint64_t width, height, array_length, samples;
     NmbBuffer *visibility; /* the pass's visibility result buffer, or null */
+    uint64_t tile_width, tile_height, imageblock_sample_length, threadgroup_memory_length; /* 0: Metal's defaults */
 };
 NmbEncoder *nmb_render_encoder_new(NmbCommandBuffer *, const struct NmbRenderPassDescriptor *);
 bool nmb_encoder_end(NmbEncoder *);
@@ -399,6 +471,27 @@ bool nmb_encoder_set_buffer_offset(NmbEncoder *, uint32_t stage, uint64_t offset
 bool nmb_encoder_set_bytes(NmbEncoder *, uint32_t stage, const void *bytes, size_t length, uint32_t index);
 bool nmb_encoder_set_texture(NmbEncoder *, uint32_t stage, NmbTexture *, uint32_t index);
 bool nmb_encoder_set_sampler(NmbEncoder *, uint32_t stage, NmbSampler *, uint32_t index);
+// The tile stage of a render encoder is stage 3 of the nmb_encoder_set_* binders. A tile pipeline is a render pipeline state made
+// from a tile descriptor (newRenderPipelineStateWithTileDescriptor:): formats are MTLPixelFormat values, 0 for no attachment.
+typedef struct {
+ NmbFunction *tile;
+ uint64_t formats[8];
+ uint64_t samples;
+ uint64_t threadgroup_matches_tile;
+ uint64_t max_threads;
+ uint64_t max_call_stack_depth;
+ uint64_t adding_binary_functions;
+ uint64_t mutability[31];
+ NmbFunction *const *linked;
+ uint64_t linked_count;
+ NmbFunction *const *private_linked;
+ uint64_t private_linked_count;
+} NmbTilePipelineDescriptor;
+NmbRenderPipeline *nmb_tile_pipeline_new(NmbDevice *, const NmbTilePipelineDescriptor *, const struct NmbPipelineOptions *options);
+bool nmb_render_tile_size(NmbEncoder *, uint64_t *size);   // width, height
+bool nmb_render_dispatch_threads_per_tile(NmbEncoder *, const uint64_t *threads);   // width, height, depth
+bool nmb_render_dispatch_threads_per_tile_in_region(NmbEncoder *, const uint64_t *threads, const uint64_t *region);
+bool nmb_render_set_threadgroup_memory_length(NmbEncoder *, uint64_t length, uint64_t offset, uint32_t index);
 
 bool nmb_compute_set_pipeline(NmbEncoder *, NmbComputePipeline *);
 bool nmb_compute_set_threadgroup_memory(NmbEncoder *, uint32_t length, uint32_t index);
@@ -444,6 +537,8 @@ bool nmb_blit_texture_to_buffer(NmbEncoder *, NmbTexture *source, uint64_t slice
                                 const uint64_t size[3], NmbBuffer *destination, uint64_t offset, uint64_t bytes_per_row,
                                 uint64_t bytes_per_image, uint64_t options /* MTLBlitOption */);
 bool nmb_blit_generate_mipmaps(NmbEncoder *, NmbTexture *);
+uint64_t nmb_command_buffer_diagnostic_id(const NmbCommandBuffer *buffer);
+void nmb_gpu_diagnostic_hook(void (*hook)(uint32_t,uint64_t,uint64_t,uint64_t));
 #ifdef __cplusplus
 }
 #endif

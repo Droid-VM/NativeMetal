@@ -8,7 +8,13 @@
 // gets its own native device too (its own driver connection, GPU address space and shader cache), as every process does with Apple's
 // own GPU plugin.
 #import <Foundation/Foundation.h>
+#include <string>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <sys/mount.h>
+#include <os/log.h>
 #include "NativeRenderServer.h"
+#include "SharedShaderCache.h"
 #include <pthread.h>
 #include <thread>
 #include <dlfcn.h>
@@ -23,51 +29,16 @@
 #include <libkern/OSCacheControl.h>
 #include <objc/message.h>
 #include "NativeAdrenoUserTest.h"
+#include "NativeTurnipSwapTest.h"
+#include "NativeGpuTrace.h"
 #include "NativeMetalBridgePhase.h"
 #include "CacheExport.h"
 #include "PrimeShaders.h"
 #include "ExceptionDiag.h"
 
-// The kernel boot argument ca-triple-buffer=1 sets the render server's CA_FORCE_TRIPLE_BUFFERED_LATENCY, as Droid-VM/macOS-DroidVM's
-// plugin sets WindowServer's: CoreAnimation renders a frame ahead (a frame of presentation latency) instead of starting each frame
-// only after the last one's buffer came back, which it does whenever a frame took longer than a refresh -- and a frame's GPU work
-// returns 8-12 ms after its commit through a virtual GPU. The option's index is found by its name (CAGetDebugOptionEnvVariableName;
-// 200 in iPadOS 27's QuartzCore, 198 in macOS 27's), so a QuartzCore that numbers its options otherwise is not given another one.
-// macOS's WindowServer (the render server there; iPadOS's is backboardd, which this leaves alone): its 4:2:0 YCbCr surface textures
-// -- video frames, the lock screen's Aerial wallpaper a 4096x2160 10-bit pool of them -- are made over their planes alone, which its
-// shaders read in place (the board's patches/metal2vulkan, METAL2VULKAN_YCBCR_PLANES_ONLY): not an image of converted texels and a
-// staging copy, about 100 MiB per 4K texture, for every pool surface the server keeps a texture of. The frontend then counts such a
-// surface in use only while a command buffer that reads it runs (NBTexture commandUse), so the decoder's pool gets its surfaces back.
-// Droid-VM/macOS-DroidVM's P4 (3623549). /private/var/ngpu/debug/no-ycbcr-planes turns it off.
-__attribute__((constructor)) static void videoPlanesInPlace() {
-    if (!nativeIsRenderServer() || strcmp(getprogname(), "WindowServer") != 0) return;
-    if (access("/private/var/ngpu/debug/no-ycbcr-planes", F_OK) == 0) return;
-    setenv("METAL2VULKAN_YCBCR_PLANES_ONLY", "1", 0);
-}
-
-__attribute__((constructor)) static void tripleBufferFromBootArgs() {
-    char args[1024] = {};
-    size_t size = sizeof(args) - 1;
-    if (!nativeIsRenderServer() || sysctlbyname("kern.bootargs", args, &size, nullptr, 0) || !strstr(args, "ca-triple-buffer=1"))
-        return;
-    auto name = reinterpret_cast<const char *(*)(unsigned)>(dlsym(RTLD_DEFAULT, "CAGetDebugOptionEnvVariableName"));
-    auto setOption = reinterpret_cast<void (*)(unsigned, bool)>(dlsym(RTLD_DEFAULT, "CASetDebugOption"));
-    setenv("CA_FORCE_TRIPLE_BUFFERED_LATENCY", "1", 1);   // for an options read after this one
-    if (!name || !setOption) return;
-    for (unsigned option = 0; option < 1024; ++option) {
-        const char *text = name(option);
-        if (text && !strcmp(text, "CA_FORCE_TRIPLE_BUFFERED_LATENCY")) {
-            setOption(option, true);
-            fprintf(stderr, "NativeAdrenoMetal: CA_FORCE_TRIPLE_BUFFERED_LATENCY (option %u) set\n", option);
-            return;
-        }
-    }
-}
-
 #if TARGET_OS_OSX
-// macOS (upstream AdrenoMetal bd09ede, from macOS-DroidVM): +[IOGPUMetalDevice registerAcceleratorService:] takes the bundle's
-// MetalPluginClassName only if it subclasses IOGPUMetalDevice; every device the plugin hands out gets IOGPU's answers (IOGPUMetalDeviceShim.h).
 #include "IOGPUMetalDeviceShim.h"
+// macOS: +[IOGPUMetalDevice registerAcceleratorService:] takes the bundle's MetalPluginClassName only if it subclasses IOGPUMetalDevice.
 @interface IOGPUMetalDevice : NSObject
 @end
 #else
@@ -94,8 +65,8 @@ static bool requestedPath(const char *name, char *path, size_t size) {
     Dl_info info = {};
     if (!dladdr(reinterpret_cast<const void *>(&requestedPath), &info) || !info.dli_fname) return false;
     snprintf(path, size, "%s", info.dli_fname);
-    // The bundle's executable: <dir>/NativeAdrenoMetal.bundle/NativeAdrenoMetal (iPadOS) or
-    // <dir>/NativeAdrenoMetal.bundle/Contents/MacOS/NativeAdrenoMetal (macOS; upstream e17d4b9).
+    // The bundle's executable: <dir>/NativeAdrenoMetal.bundle/NativeAdrenoMetal (iOS) or
+    // <dir>/NativeAdrenoMetal.bundle/Contents/MacOS/NativeAdrenoMetal (macOS).
     char *bundle = strstr(path, "/NativeAdrenoMetal.bundle/");
     if (!bundle) return false;
     snprintf(bundle + 1, size - size_t(bundle + 1 - path), "%s", name);
@@ -118,6 +89,7 @@ static Gpu *makeGpu(unsigned port) {
     return gpu;
 }
 static std::string gCacheDirectory;   // the runtime's cache directory (the one that opened the device), exported by CacheExport.h
+static bool gFillsSystemCache;        // the render server opened its device in the system shader cache's directory (SharedShaderCache.h)
 // Progress markers 0x68xx (GPU6): 6800 entered, 6801 Turnip found, 6802 device made, 6803 returned to the discovery, 68f1 no Turnip, 68f2 no device.
 static unsigned gDiagBits;
 // Reads of the render server's own state for the framebuffer-format question (diagnostic only, for the exact QuartzCore of the target image; a read
@@ -126,23 +98,34 @@ static bool readTask(uintptr_t address, void *out, size_t size) {
     vm_size_t got = 0;
     return vm_read_overwrite(mach_task_self(), address, size, (vm_address_t) out, &got) == KERN_SUCCESS && got == size;
 }
-[[maybe_unused]] static bool writeTask(uintptr_t address, const void *data, size_t size) {   // iPadOS QuartzCore addresses only
+[[maybe_unused]] static bool writeTask(uintptr_t address, const void *data, size_t size) {   // iPadOS only (24A446 QuartzCore)
     return vm_write(mach_task_self(), address, (vm_offset_t) data, (mach_msg_type_number_t) size) == KERN_SUCCESS;
 }
 // EXPERIMENT (second report onward): this display path takes plain 8-bit BGRA only, so tell the render server's display that it has neither the deep
 // (10-bit) framebuffer nor universal buffer compression. Whether the state it reads those from is the whole story is what the markers show.
-// EXPERIMENT (boot-arg sheng-fb-bgra=1): the render server's framebuffer format with every other virtualized answer left as it is.
+// EXPERIMENT (boot-arg fb-bgra=1): the render server's framebuffer format with every other virtualized answer left as it is.
 // framebuffer_pixel_format (24A446 0x184461838) takes RGhA on `tbnz w8, #0` at 0x184461928 when CADeviceIsVirtualized (byte 0x1e701bdd9) is 1;
 // 40 other places in QuartzCore read the same byte (XR formats, backdrop compute, ASTC ...). Holding the byte at 0 turned all of them, and the
 // tablet drew light blue blocks. Here the byte stays 1 and only this branch is made a NOP, so the framebuffer is chosen as on a real device and
 // nothing else changes. Marks 0x6E40 unreadable, 0x6E41 other instruction, 0x6E42 patched, 0x6E50|stage failures.
+// The boot argument token that starts with prefix (a whole name, or name=value), or nullptr: a name is matched only at the start of the
+// command line or after a space, so "log=1" does not find "cache-log=1".
+static const char *bootArgToken(const char *args, const char *prefix) {
+    const size_t length = strlen(prefix);
+    for (const char *at = args; (at = strstr(at, prefix)); at += length)
+        if (at == args || at[-1] == ' ') return at;
+    return nullptr;
+}
 static bool bootArgSet(const char *key) {
     char args[1100] = {};
     size_t size = sizeof args - 1;
-    return sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0 && strstr(args, key);
+    if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) != 0) return false;
+    const char *at = bootArgToken(args, key);
+    const size_t length = strlen(key);
+    return at && (at[length] == 0 || at[length] == ' ');
 }
-[[maybe_unused]] static unsigned patchFramebufferBranch(uintptr_t slide) {
-    const uintptr_t site = 0x184461928 + slide;
+// `site` is the slid address of that branch in the running QuartzCore; any other word there is left alone (0x6E41).
+[[maybe_unused]] static unsigned patchFramebufferBranch(uintptr_t site) {
     uint32_t word = 0;
     if (!readTask(site, &word, sizeof word)) return 0x6E40;
     if (word == 0xd503201f) return 0x6E42;
@@ -157,70 +140,6 @@ static bool bootArgSet(const char *key) {
     if (!restored) return 0x6E53;
     return 0x6E42;
 }
-static unsigned gReports;
-struct DisplaySample {unsigned flags = 0, mode = 0, behaviour = 0, globals = 0; uint16_t display = 0; uintptr_t object = 0;};
-static DisplaySample sampleDisplay(id first, intptr_t slide) {
-    DisplaySample out;
-    uintptr_t a = first ? (uintptr_t) *(void **) ((char *) (__bridge void *) first + 8) : 0, b = 0, d = 0;
-    if (a && readTask(a + 0x40, &b, 8) && b && readTask(b + 0x60, &d, 8) && d) {
-        uint32_t f = 0; uint64_t m = 0; uint8_t byte[4] = {};
-        readTask(d + 0x238, &f, 4);
-        readTask(d + 0x258, &out.display, 2);
-        readTask(d + 0x248, &m, 8);
-        readTask(d + 0x6c17, &byte[0], 1);
-        readTask(d + 0x6658 + 0x57d, &byte[1], 1);
-        readTask(d + 0x6658 + 0x58a, &byte[2], 1);
-        readTask(d + 0x6658 + 0x59b, &byte[3], 1);
-        out.object = d;
-        out.flags = f & 0xff;
-        out.mode = (unsigned) ((m >> 55) & 31) | (m ? 0x20 : 0);
-        out.behaviour = (byte[0] ? 1 : 0) | (byte[1] ? 2 : 0) | (byte[2] ? 4 : 0) | (byte[3] ? 8 : 0);
-    }
-    uint8_t v[4] = {};
-    readTask(0x1f491ae10 + slide, &v[0], 1);    // the render server's deep-framebuffer flag
-    readTask(0x1ed7abf10 + slide, &v[1], 1);    // framebuffer compression in effect
-    readTask(0x1f4919dc0 + slide, &v[2], 1);    // its default
-    readTask(0x1f4919c20 + slide, &v[3], 1);    // universal buffer compression
-    out.globals = (v[0] ? 1 : 0) | (v[1] ? 2 : 0) | (v[2] ? 4 : 0) | (v[3] ? 8 : 0);
-    return out;
-}
-static void markSample(Gpu &gpu, const DisplaySample &x, unsigned base) {
-    gpu.mark(base | (x.flags << 4) | x.globals);                  // display flags (bit 3 deep), globals: deep/compression/default/universal
-    gpu.mark((base + 0x1000) | (x.display >> 4));                 // display limits word: 0x200 compression support, 0x1c00 type
-    gpu.mark((base + 0x2000) | (x.mode << 4) | x.behaviour);     // mode colour field, ICC/other behaviour bytes
-}
-static void reportDisplayState(Gpu &gpu) {
-#if defined(__arm64e__)
-    (void)gpu;
-    return;   // the addresses above are the 21H461 cache's; the arm64e (iPadOS 27) build must not read or write them
-#endif
-    ++gReports;
-    static DisplaySample before;
-    static bool changed;
-    Class serverClass = NSClassFromString(@"CAWindowServer");
-    void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart");
-    if (!serverClass || !start) return;
-    const intptr_t slide = (intptr_t) start - 0x189651efc;
-    @try {
-        id server = ((id (*)(id, SEL)) objc_msgSend)(serverClass, NSSelectorFromString(@"serverIfRunning"));
-        NSArray *displays = server ? ((id (*)(id, SEL)) objc_msgSend)(server, NSSelectorFromString(@"displays")) : nil;
-        id first = displays.count ? displays[0] : nil;
-        DisplaySample now = sampleDisplay(first, slide);
-        if (!changed) {
-            before = now;
-            if (gReports >= 2 && now.object) {
-                uint32_t f = 0;
-                if (readTask(now.object + 0x238, &f, 4) && (f & 8)) {f &= ~8u; writeTask(now.object + 0x238, &f, 4);}
-                uint8_t zero = 0;
-                writeTask(0x1f4919c20 + slide, &zero, 1);
-                changed = true;
-                now = sampleDisplay(first, slide);
-            }
-        }
-        markSample(gpu, before, 0x7000);
-        markSample(gpu, now, 0xA000);
-    } @catch (NSException *) {}
-}
 // Every process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
 // display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
 // The reason a client's device failed, as a text line the driver keeps per process (the render server's report row is rewritten every ten seconds):
@@ -234,6 +153,41 @@ static void removeHalfImported(const char *root) {
     while (FTSENT *e = fts_read(fts))
         if (e->fts_info == FTS_F && e->fts_namelen > 7 && !strcmp(e->fts_name + e->fts_namelen - 7, ".import")) unlink(e->fts_path);
     fts_close(fts);
+}
+// diag=1 in the render server: the bridge's telemetry table (native_bridge_metal_telemetry) to the kernel's board log every six
+// seconds and to the system log every thirty. The kernel keeps 48 rows of at most 95 characters (its [metal table] section): the
+// marker 0xC000 | row starts a row, 0x8000 | a << 7 | b appends two characters. A row that reads as it did when last sent is not
+// sent again, and a row the table no longer has is cleared. The system log has every row, past the 48th too.
+static void *streamTelemetry(void *arg) {
+    Gpu *g = static_cast<Gpu *>(arg);
+    pthread_setname_np("native-metal-telemetry");
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);   // a row is up to 46 marker calls: behind the render server's own work
+    sleep(5);
+    static char table[8192], sent[48][92];
+    for (unsigned pass = 0;; ++pass) {
+        native_bridge_metal_telemetry(table, sizeof table);
+        unsigned row = 0;
+        for (char *line = table; *line; ++row) {
+            char *end = strchr(line, '\n');
+            if (end) *end = 0;
+            if (pass % 5 == 0) os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal table: %{public}s", line);
+            if (row < 48 && strncmp(sent[row], line, sizeof sent[row] - 1)) {
+                strlcpy(sent[row], line, sizeof sent[row]);
+                g->mark(0xC000u | row);
+                const size_t length = strlen(sent[row]);
+                for (size_t i = 0; i < length; i += 2) {
+                    const unsigned a = (unsigned char)sent[row][i] & 0x7f, b = i + 1 < length ? (unsigned char)sent[row][i + 1] & 0x7f : 0;
+                    g->mark(0x8000u | (a << 7) | b);
+                }
+            }
+            if (!end) {++row; break;}
+            line = end + 1;
+        }
+        for (; row < 48; ++row)
+            if (sent[row][0]) {sent[row][0] = 0; g->mark(0xC000u | row);}
+        sleep(6);
+    }
+    return nullptr;
 }
 static unsigned gClientPort;
 static void clientFailure(unsigned port, const char *step, const char *detail) {
@@ -260,121 +214,6 @@ static void clientFailure(unsigned port, const char *step, const char *detail) {
             }
     }
 }
-// Each process's own render passes, as its Turnip recorded them (NativeBridgeMetalFrontend.mm): the slowest one's size, format and draw
-// count and the pass total, on the client's text line every 10 s while the diagnostics are on. A client whose jobs each took 77 ms showed
-// only that; which pass and at what size is what says whether the cost is the driver's.
-extern "C" size_t nmb_slowest_pass(char *out, size_t size) __attribute__((weak));
-static void startPassReporter(unsigned port) {
-    if (!getenv("SHENG_DIAG") || !&nmb_slowest_pass) return;
-    static std::atomic<bool> started{false};
-    if (started.exchange(true)) return;
-    Gpu *gpu = makeGpu(port);
-    if (!gpu) return;
-    std::thread([gpu]{
-        pthread_setname_np("pass-reporter");
-        for (;;) {
-            sleep(5);
-            char row[200];
-            if (!nmb_slowest_pass(row, sizeof row) || !row[0]) continue;
-            streamText(*gpu, row);
-        }
-    }).detach();
-}
-// Diagnostic: while /private/var/ngpu/debug/client-mem exists when a process opens its device (the render server too), the process
-// writes every 5 s to m2v-mem.txt in its temporary directory, renamed into place whole: "<name> <pid> <unix time> <row>" (its memory
-// row, nmb_memory_row: what its Metal calls hold against what the runtime holds), its largest resources (nmb_memory_top), then the
-// runtime's placements by the source line that asked for them (m2v_placement_sites) and its pools' blocks (m2v_pool_report). The
-// kernel's per-client text rows hold 8 processes, and a wallpaper extension came after them.
-extern "C" size_t nmb_memory_row(char *out, size_t size) __attribute__((weak));
-extern "C" size_t nmb_memory_top(char *out, size_t size, unsigned count) __attribute__((weak));
-extern "C" size_t nmb_split_row(char *out, size_t size) __attribute__((weak));
-// The runtime's live placements by the source line that asked for them (the board's patches/metal2vulkan/0028).
-extern "C" size_t m2v_placement_sites(uint8_t *out, size_t size) __attribute__((weak));
-// Its pools' blocks: size, used, free ranges, longest free range (0031).
-extern "C" size_t m2v_pool_report(uint8_t *out, size_t size) __attribute__((weak));
-// The bridge's sampled heap sites (its counting allocator): turned on here, then "heap MiB samples frames" lines, a frame +offset in
-// the plugin (its link map names it) or *offset in another image.
-extern "C" void nmb_heap_sampling(void) __attribute__((weak));
-extern "C" size_t nmb_heap_sites(uint64_t *out, size_t max) __attribute__((weak));
-static void writeHeapSites(FILE *file) {
-    if (!&nmb_heap_sites) return;
-    static uint64_t sites[64 * 14];
-    const size_t n = nmb_heap_sites(sites, 64);
-    static Dl_info self = {};
-    static const bool selfFound = dladdr((const void *)&nmb_heap_sites, &self);
-    for (size_t i = 0; i < n; ++i) {
-        const uint64_t *site = sites + i * 14;
-        fprintf(file, "heap %.2f %llu", site[0] / 1048576.0, (unsigned long long)site[1]);
-        for (unsigned f = 0; f < 12 && site[2 + f]; ++f) {
-            Dl_info info = {};
-            const bool found = dladdr((const void *)site[2 + f], &info) && info.dli_fbase;
-            const bool mine = found && selfFound && info.dli_fbase == self.dli_fbase;
-            fprintf(file, " %c%llx", mine ? '+' : '*', (unsigned long long)(found ? site[2 + f] - (uint64_t)info.dli_fbase : site[2 + f]));
-        }
-        fputc('\n', file);
-    }
-}
-static void startMemoryWriter() {
-    if (!&nmb_memory_row || access("/private/var/ngpu/debug/client-mem", F_OK) != 0) return;
-    static std::atomic<bool> started{false};
-    if (started.exchange(true)) return;
-    char dir[512];
-    if (!confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir - 32)) return;
-    std::string path = std::string(dir) + "m2v-mem.txt", partial = path + ".new";
-    if (&nmb_heap_sampling) nmb_heap_sampling();
-    std::thread([path, partial]{
-        pthread_setname_np("memory-writer");
-        for (;;) {
-            char row[128];
-            if (nmb_memory_row(row, sizeof row) && row[0])
-                if (FILE *file = fopen(partial.c_str(), "w")) {
-                    fprintf(file, "%s %d %ld %s\n", getprogname(), getpid(), (long)time(nullptr), row);
-                    // Then the 24 largest textures and buffers its Metal calls hold.
-                    static char top[4096];
-                    if (&nmb_memory_top && nmb_memory_top(top, sizeof top, 24)) fputs(top, file);
-                    // Then where the runtime's own placements came from (shadows, twins, staging): "site MiB count file:line".
-                    if (&m2v_placement_sites && m2v_placement_sites(reinterpret_cast<uint8_t *>(top), sizeof top)) fputs(top, file);
-                    if (&m2v_pool_report && m2v_pool_report(reinterpret_cast<uint8_t *>(top), sizeof top)) fputs(top, file);
-                    if (&nmb_split_row && nmb_split_row(top, sizeof top)) fputs(top, file);
-                    writeHeapSites(file);
-                    fclose(file);
-                    rename(partial.c_str(), path.c_str());
-                }
-            sleep(5);
-        }
-    }).detach();
-}
-// The runtime's pooled block size for a test, from /private/var/ngpu/debug/block-mib (the board's patches/metal2vulkan/0019; 64 MiB, the
-// runtime's own, without it). Every block is wired guest memory here, but 16 MiB blocks hung the render server's GPU context on 3 of 5
-// app open/close cycles (0 of 5 at 64: more images take dedicated blocks and spares), so smaller blocks stay a test.
-static void boundPooledBlocks() {
-    char text[16] = {};
-    if (FILE *file = fopen("/private/var/ngpu/debug/block-mib", "r")) {
-        if (!fgets(text, sizeof text, file)) text[0] = 0;
-        fclose(file);
-    }
-    if (text[0]) setenv("METAL2VULKAN_BLOCK_MIB", text, 0);
-}
-// A client's cache of freed BOs (Turnip's darwin backend: TU_DARWIN_BO_CACHE_MB, 96 by default, and TU_DARWIN_BO_CACHE_SMALL_MB for BOs
-// of at most 1 MiB, 16): 16 and 8 MiB in every process but the render server, which keeps the defaults. Every BO is wired guest memory
-// and each resident client kept its cache full: the wallpaper extension held 56 MiB of freed BOs for a still picture, widgets and
-// SpringBoard 30-40 MiB each. A test's sizes from /private/var/ngpu/debug/client-bo-cache-mb ("BIG SMALL" in MiB; a BIG of 0 is no
-// limit, as Turnip reads it).
-static void boundClientBoCache() {
-    unsigned big = 16, small = 8;
-    if (FILE *file = fopen("/private/var/ngpu/debug/client-bo-cache-mb", "r")) {
-        unsigned b = 0, s = 0;
-        const int n = fscanf(file, "%u %u", &b, &s);
-        if (n >= 1) big = b;
-        if (n >= 2) small = s;
-        fclose(file);
-    }
-    char text[16];
-    snprintf(text, sizeof text, "%u", big);
-    setenv("TU_DARWIN_BO_CACHE_MB", text, 0);
-    snprintf(text, sizeof text, "%u", small);
-    setenv("TU_DARWIN_BO_CACHE_SMALL_MB", text, 0);
-}
 static id clientDevice(unsigned port) {
     char turnip[1024];
     if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) {clientFailure(port, "no-turnip", ""); return nil;}
@@ -385,17 +224,22 @@ static id clientDevice(unsigned port) {
     }
     // IOSurfaces this GPU reads or writes must be plain rows, as in the render server.
     CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
-    boundPooledBlocks();
-    boundClientBoCache();
-    char candidates[2][512] = {};
+    char candidates[3][512] = {};
     if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
     if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
+    strlcpy(candidates[2], sharedShaderCacheDirectory().c_str(), sizeof candidates[2]);
     id device = nil;
     const char *lastError = "";
     unsigned usable = 0;
-    for (unsigned i = 0; i < 2 && !device; ++i) {
+    for (unsigned i : {2u, 0u, 1u}) {
+        if (device) break;
         if (!candidates[i][0]) continue;
-        strlcat(candidates[i], "m2v", sizeof candidates[i]);
+        // In the user cache directory the cache sits inside Metal's own shader cache directory (com.apple.metal): a sandboxed process may
+        // write there whenever its profile lets Metal cache shaders at all (macOS iconservicesagent: its profile allows METAL_CACHE_PATH
+        // and denied every write to <cache>/m2v, so each of its launches compiled every pipeline again and it was killed at its memory
+        // limit within seconds).
+        if (i == 0) {strlcat(candidates[i], "com.apple.metal", sizeof candidates[i]); mkdir(candidates[i], 0700); strlcat(candidates[i], "/", sizeof candidates[i]);}
+        if (i != 2) strlcat(candidates[i], "m2v", sizeof candidates[i]);
         mkdir(candidates[i], 0700);
         if (access(candidates[i], W_OK) != 0) continue;
         ++usable;
@@ -424,14 +268,48 @@ static id clientDevice(unsigned port) {
     // once-a-second reader never ran before the crash (i568).
     if (device) {
         gClientPort = port;
-        startPassReporter(port);
-        startMemoryWriter();
         native_bridge_metal_problem_hook = [](const char *problem) {clientFailure(gClientPort, "problem", problem);};
         char problem[200] = {};
         if (native_bridge_metal_first_problem(problem, sizeof problem) && problem[0]) clientFailure(port, "problem", problem);
     }
     return device;
 }
+#if TARGET_OS_OSX
+// The compositor's QuartzCore asserts metallib_url != nil (CA::OGL::new_metal_context: [[NSBundle bundleForClass:[CALayer class]]
+// URLForResource:@"default" withExtension:@"metallib"]) on this layout (macOS run32), though both the root and the SystemOS volume hold
+// QuartzCore.framework/Versions/A/Resources/default.metallib. Measured here, in the render server, with the same calls, before QuartzCore
+// makes its Metal context: what the bundle resolves to, and what readdir and NSFileManager list at the bundle's root and in Versions.
+static void quartzCoreBundleReport() {
+    @autoreleasepool {
+        Class layer = NSClassFromString(@"CALayer");
+        NSBundle *bundle = layer ? [NSBundle bundleForClass:layer] : nil;
+        NSURL *url = [bundle URLForResource:@"default" withExtension:@"metallib"];
+        os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal qc: bundle %{public}s resources %{public}s exec %{public}s url %{public}s",
+               bundle.bundlePath.UTF8String ?: "-", bundle.resourcePath.UTF8String ?: "-", bundle.executablePath.UTF8String ?: "-",
+               url.path.UTF8String ?: "nil");
+        NSString *root = bundle.bundlePath ?: @"/System/Library/Frameworks/QuartzCore.framework";
+        for (NSString *sub in @[@"", @"/Versions", @"/Versions/A", @"/Versions/A/Resources", @"/Resources"]) {
+            NSString *path = [root stringByAppendingString:sub];
+            std::string listing;
+            if (DIR *d = opendir(path.fileSystemRepresentation)) {
+                while (struct dirent *e = readdir(d)) {listing += e->d_name; listing += ' ';}
+                closedir(d);
+            } else listing = "(opendir " + std::to_string(errno) + ")";
+            NSArray *items = [NSFileManager.defaultManager contentsOfDirectoryAtPath:path error:nil];
+            struct stat st = {};
+            const int sr = lstat(path.fileSystemRepresentation, &st);
+            // opendir reads a whole union directory (both layers) only when fstatfs reports MNT_UNION (0x20) for it.
+            struct statfs sf = {};
+            const int fr = statfs(path.fileSystemRepresentation, &sf);
+            os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal qc: %{public}s statfs %d flags 0x%x %{public}s on %{public}s",
+                   path.UTF8String, fr, sf.f_flags, sf.f_fstypename, sf.f_mntonname);
+            os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal qc: %{public}s lstat %d mode %o dev %d readdir [%{public}s] fm [%{public}s]",
+                   path.UTF8String, sr, st.st_mode, st.st_dev, listing.c_str(),
+                   [[items componentsJoinedByString:@" "] UTF8String] ?: "nil");
+        }
+    }
+}
+#endif
 static id deviceForPort(unsigned port) {
     static id device;
     static bool tried;
@@ -439,106 +317,93 @@ static id deviceForPort(unsigned port) {
         if (tried) return device;
         tried = true;
         exceptiondiag::start(); // the throw site of an uncaught exception, for the kernel's THROW row (ExceptionDiag.h)
-        // No concurrent binning in any Metal process: with it BV ran ahead of BR and the two stopped waiting on each other inside a pass
-        // (int-261p, int-262, and in system memory int-265). Without it Turnip's autotune picks tile memory (GMEM) or system memory per
-        // pass: i553 forced system memory for every pass, the GPU busy 19 % at 680 MHz. A tile store writes whole 16x4 blocks, which the
-        // runtime keeps within a texture's rows (bridge patch 0016).
-        // Experiments without a rebuild: each NAME=VALUE line of /private/var/ngpu/debug/env goes into this process's environment
-        // (Turnip's driconf options answer to their names there, tu_dont_care_as_load=true for one), before the defaults below.
-        if (FILE *vars = fopen("/private/var/ngpu/debug/env", "r")) {
-            char line[256];
-            while (fgets(line, sizeof line, vars)) {
-                line[strcspn(line, "\r\n")] = 0;
-                char *equals = strchr(line, '=');
-                if (!equals || equals == line || line[0] == '#') continue;
-                *equals = 0;
-                setenv(line, equals + 1, 1);
-            }
-            fclose(vars);
-        }
+        // /private/var/ngpu/tu_debug, when present, holds TU_DEBUG for every Metal process (the boot argument tu-debug= comes after it).
         if (FILE *flags = fopen("/private/var/ngpu/tu_debug", "r")) {
             char line[128] = {};
             if (fgets(line, sizeof line, flags)) {line[strcspn(line, "\n")] = 0; setenv("TU_DEBUG", line, 1);}
             fclose(flags);
         }
-        // sheng-tu-debug=<flags>: TU_DEBUG for every Metal process (an experiment: sysmem renders without GMEM load and store, gmem always with them).
+        // tu-debug=<flags>: TU_DEBUG for every Metal process (an experiment: sysmem renders without GMEM load and store, gmem always with them).
         {
             char args[1100] = {};
             size_t size = sizeof args - 1;
             if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
-                if (const char *at = strstr(args, "sheng-tu-debug=")) {
+                if (const char *at = bootArgToken(args, "tu-debug=")) {
                     char value[64] = {};
-                    strlcpy(value, at + 15, sizeof value);
+                    strlcpy(value, at + strlen("tu-debug="), sizeof value);
                     value[strcspn(value, " ")] = 0;
                     setenv("TU_DEBUG", value, 1);
+                    // Turnip's log (what perf and the other flags print) goes to the system log and to a file of this process beside
+                    // the frame trace: a daemon's stderr goes nowhere, and the system log keeps warnings and errors only.
+                    setenv("MESA_LOG", "file,syslog", 0);
+                    char log[96];
+                    mkdir("/private/var/tmp/NativeAdrenoMetal.trace", 0755);
+                    snprintf(log, sizeof log, "/private/var/tmp/NativeAdrenoMetal.trace/mesa-%s-%d.log", getprogname(), (int)getpid());
+                    setenv("MESA_LOG_FILE", log, 0);
                 }
         }
-        // Every pass renders in system memory with the 8-bit BGRA framebuffer (sheng-fb-bgra=1): measured against tile memory with the swap of
-        // GMEM loads and stores fixed (patches/mesa/turnip-gmem-mutable-swap.patch, lock screen 99.5 % equal to the RGhA picture), the GPU time per
-        // command buffer was no better (17.8 ms mean and 56.1 ms at p95 in tile memory, 17.1 and 52.1 in system memory), and one home screen frame
-        // still came out with red and blue exchanged. sheng-tu-debug= overrides this for experiments.
-        // The render server keeps the autotuner like every other process. For a day (2026-11-12) it rendered in system memory here:
-        // its tile memory (GMEM) passes left a zeroed 1536x2400 rectangle and displaced 32x8 blocks in one of the display's two
-        // framebuffers, which showed on every other frame. That was not Turnip's doing: the host had put this guest's compositor
-        // queue in the KGSL ringbuffer of Android's own UI at another priority, whose work came in between the pass's bins
-        // (virglrenderer drm2kgsl, kgsl_priority_flags). /private/var/ngpu/tu_debug and sheng-tu-debug= above still replace this.
-        setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
-        // sheng-diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
+        // Turnip chooses each pass's rendering: tile memory (GMEM) or system memory, by its own rules (a pass with a memoryless
+        // attachment or a feedback loop in tile memory, a pass of few draws in system memory, the others by the bandwidth each would
+        // take). A pass in system memory has no tile load and store, which is what a screen-size pass that
+        // draws on a small part of its target otherwise pays for whole. The colour order of GMEM loads and stores is the image's own
+        // swap on the memory side (patches/mesa/turnip-gmem-memory-side-swap.patch). The RM row of the memory log counts both kinds;
+        // tu-debug= (for instance gmem,nocb: every pass in tile memory, no concurrent binning) overrides this.
+        // Concurrent binning is a Turnip option that is off unless asked for (tu_allow_concurrent_binning, read from the environment
+        // by Mesa's option parser): with it the BV thread bins a pass while BR still renders the one before. tu-cb=1 turns it on.
+        // It stays at Mesa's default, off: what it gains here was never measured.
+        if (bootArgSet("tu-cb=1")) setenv("tu_allow_concurrent_binning", "true", 0);
+        // diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
-        if (bootArgSet("sheng-diag=1")) setenv("SHENG_DIAG", "1", 1);
+        if (bootArgSet("diag=1") || bootArgSet("gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
         else unsetenv("SHENG_DIAG");
+        if (bootArgSet("gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
+        else unsetenv("SHENG_GPU_TRACE");
+        // The bridge's work placement (metal-flow=<bits>, read below). Any value logs the FL counts
+        // (native_bridge_metal_open), so two runs compare without diag=1's own cost.
+        // gpu-purge=0: the bridge discards nothing of what callers declare Volatile (NativeMetalPurge.rs), for a comparison on the
+        // same image. Read by the bridge as the device opens.
+        if (bootArgSet("gpu-purge=0")) setenv("NATIVE_METAL_PURGE", "0", 1);
+        else unsetenv("NATIVE_METAL_PURGE");
+        // gpu-ycbcr-planes=0: every two-plane YCbCr surface texture is made with its converted image, as before bridge patch 0035,
+        // for a comparison on the same image. Read by the bridge at the first such texture.
+        if (bootArgSet("gpu-ycbcr-planes=0")) setenv("NATIVE_METAL_YCBCR_PLANES", "0", 1);
+        else unsetenv("NATIVE_METAL_YCBCR_PLANES");
+        // Turnip compiles inside vkCreate*Pipelines on the calling thread: the runtime makes the call there instead of on a thread it
+        // starts for it (its relay exists for a driver whose compiler service takes the asking thread's class).
+        setenv("METAL2VULKAN_COMPILE_ON_ASKING_THREAD", "1", 1);
+        // metal-tile=1: the device also answers the family that has tile shaders (bridge: tile_shaders_offered).
+        if (bootArgSet("metal-tile=1")) setenv("NATIVE_METAL_TILE", "1", 1); else unsetenv("NATIVE_METAL_TILE");
+        {
+            // metal-flow=<bits>: 1 the lowering thread, 2 commit submission, 4 the warm pass; all three without the argument.
+            char args[1100] = {}, flow[16] = "";
+            size_t size = sizeof args - 1;
+            if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
+                if (const char *at = bootArgToken(args, "metal-flow=")) {
+                    strlcpy(flow, at + strlen("metal-flow="), sizeof flow);
+                    flow[strcspn(flow, " ")] = 0;
+                }
+            if (flow[0]) setenv("NATIVE_METAL_FLOW", flow, 1);
+            else unsetenv("NATIVE_METAL_FLOW");
+        }
+        if (bootArgSet("wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
         if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
         else unsetenv("SHENG_LOG_GPU");
-        // Diagnostic: while /private/var/ngpu/debug/mesa-log exists when the process opens its device, Mesa's log -- Turnip's reason
-        // for a lost device among it -- goes to mesa.log in the process's temporary directory instead of the stderr no reader of a
-        // daemon's sees, and a lost device aborts the process where Turnip declares it, so the crash report names the place.
-        if (access("/private/var/ngpu/debug/mesa-log", F_OK) == 0) {
-            char log[512];
-            if (confstr(_CS_DARWIN_USER_TEMP_DIR, log, sizeof log - 16)) {strlcat(log, "mesa.log", sizeof log); setenv("MESA_LOG_FILE", log, 1);}
-            setenv("MESA_VK_ABORT_ON_DEVICE_LOSS", "1", 1);
-        }
-        // Diagnostic: while /private/var/ngpu/debug/gpu-traces exists when the process opens its device, Turnip's u_trace writes the
-        // GPU's own timestamps around each render pass and its stages (binning, each tile's loads and stores, sysmem clears, blits)
-        // to gpu-traces.log in the process's temporary directory (MESA_GPU_TRACES=print): where a frame's GPU time goes, measured
-        // rather than inferred (a 2048x2732 frame took 5-6 ms of GPU time whatever the GPU clock).
-        if (access("/private/var/ngpu/debug/gpu-traces", F_OK) == 0) {
-            char path[512];
-            if (confstr(_CS_DARWIN_USER_TEMP_DIR, path, sizeof path - 16)) {strlcat(path, "gpu-traces.log", sizeof path); setenv("MESA_GPU_TRACEFILE", path, 1);}
-            setenv("MESA_GPU_TRACES", "print", 1);
-        }
-        // A/B: while /private/var/ngpu/debug/no-inline-memoryless exists when the process opens its device, a render pass with a
-        // memoryless color records its first instance in a secondary (fork patches/metal2vulkan/0014, METAL2VULKAN_INLINE_MEMORYLESS=0),
-        // so a later draw that writes the color no longer splits the pass: Core Animation's 2048x2732 frame passes split so at almost
-        // every frame (the PS row's ml), storing and loading the whole frame again on the tiler.
-        if (access("/private/var/ngpu/debug/no-inline-memoryless", F_OK) == 0) setenv("METAL2VULKAN_INLINE_MEMORYLESS", "0", 1);
-        // A/B: while /private/var/ngpu/debug/bo-cache-unsplit exists when the process opens its device, Turnip's freed-BO cache keeps
-        // every BO in one budget, as before the fork's patches/mesa/turnip-darwin-bo-cache-small-budget.patch (TU_DARWIN_BO_CACHE_SMALL_MB=0).
-        if (access("/private/var/ngpu/debug/bo-cache-unsplit", F_OK) == 0) setenv("TU_DARWIN_BO_CACHE_SMALL_MB", "0", 1);
-        // A/B: /private/var/ngpu/debug/keep-room-mib, read when the process opens its device: the most room the runtime keeps in
-        // each of its pools for its encodings (the board's patches/metal2vulkan/0027, METAL2VULKAN_KEEP_ROOM_MIB), half a block
-        // without it. The room is one free range: the render server's pooled blocks were half empty.
-        if (FILE *file = fopen("/private/var/ngpu/debug/keep-room-mib", "r")) {
-            char text[16] = {};
-            if (fgets(text, sizeof text, file) && text[0] >= '0' && text[0] <= '9') setenv("METAL2VULKAN_KEEP_ROOM_MIB", text, 1);
-            fclose(file);
-        }
-        // A/B: while /private/var/ngpu/debug/no-backing-cover exists when the process opens its device, each memoryless color
-        // backing serves only its own extent (the board's patches/metal2vulkan/0029 off, METAL2VULKAN_BACKING_COVER=0).
-        if (access("/private/var/ngpu/debug/no-backing-cover", F_OK) == 0) setenv("METAL2VULKAN_BACKING_COVER", "0", 1);
-        // A/B: while /private/var/ngpu/debug/no-lazy-bos exists when the process opens its device, Turnip offers no lazily allocated
-        // memory (the board's patches/mesa/turnip-darwin-lazy-bos.patch off): memoryless textures take memory of their own again.
-        if (access("/private/var/ngpu/debug/no-lazy-bos", F_OK) == 0) setenv("TU_DARWIN_LAZY_BOS", "0", 1);
-        // With the memory writer (client-mem, below) the runtime keeps a report of its pools' blocks too (0031).
-        if (access("/private/var/ngpu/debug/client-mem", F_OK) == 0) setenv("METAL2VULKAN_POOL_REPORT", "1", 1);
 #if TARGET_OS_OSX
-        // macOS: Turnip opens the accelerator by its class (AGXAccelerator, package/macos/DroidVMAccelerator.cpp of the board); the
-        // display takes plain rows (no framebuffer compression). The render server is WindowServer (NativeRenderServer.h); every device
-        // gets IOGPU's answers (upstream bd09ede).
+        // macOS: Turnip opens the accelerator by class (AGXAccelerator here); the display takes plain rows (no Apple framebuffer or IOSurface
+        // compression). The runtime keeps its default block size: the virtual-machine board shrank it for a 512 MiB GPU pool, which this
+        // GPU's window does not have. The render server (WindowServer) takes the same path as backboardd on iPadOS below (display hand-off
+        // client, shader cache directory, pipeline pack, priming), without the iPadOS QuartzCore addresses; every device gets IOGPU's
+        // answers (IOGPUMetalDeviceShim.h).
         setenv("TU_DARWIN_SERVICE", "AGXAccelerator", 1);
         setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         if (!nativeIsRenderServer()) {
+            // The system shader cache the render server fills (SharedShaderCache.h), read for what this process's own cache lacks.
+            // gpu-prime-system=0: no process reads it and the render server keeps its cache and its priming to itself, as before, for
+            // a comparison on the same image.
+            if (!bootArgSet("gpu-prime-system=0"))
+                native_bridge_metal_system_cache(systemcache::kReaderPath, systemcache::kOwners, 2, false);
             device = clientDevice(port);
             if (device) iogpu::install(device, port);
             return device;
@@ -546,9 +411,6 @@ static id deviceForPort(unsigned port) {
 #else
         if (!nativeIsRenderServer()) return device = clientDevice(port);
 #endif
-        // From here the process is the render server: the frontend's policies for it (the encode thread's priority, ending it
-        // after a GPU loss) follow this, not the process's name.
-        native_bridge_metal_set_render_server(true);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
             if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);
@@ -606,7 +468,8 @@ static id deviceForPort(unsigned port) {
         setenv("CA_DISPLAY_EDR_HEADROOM", "1", 1);
         setenv("CA_FP16_MIN_HEADROOM", "1e30", 1);
         setenv("CA_ALLOW_EDR_MIRRORING", "0", 1);
-#if !TARGET_OS_OSX   // the stored option values and the framebuffer branch are addresses of iPadOS 27's QuartzCore (24A446)
+#if !TARGET_OS_OSX
+        // The stored option values and the framebuffer branch are addresses of iPadOS 27's QuartzCore (24A446).
         if (void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart")) {
             const uintptr_t slide = (uintptr_t)ptrauth_strip(start, ptrauth_key_function_pointer) - 0x1846dce88;
             const float one = 1.0f, never = 1e30f;
@@ -614,15 +477,7 @@ static id deviceForPort(unsigned port) {
             gpu->mark(writeTask(0x1e7021104 + slide, &never, sizeof never) ? 0x6E02 : 0x6EF2);
             const uint8_t off = 0;
             gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
-            // CADeviceIsVirtualized: framebuffer_pixel_format takes RGhA on a virtual device. QuartzCore asks MobileGestalt's
-            // IsVirtualDevice once (sub_184541f10 stores the answer at 0x1e701bdd9, its dispatch_once token at 0x1e7020780) and the
-            // answer is the board's vmm-present (i623fa0abd read IsVirtualDevice = 1). The board keeps vmm-present for AMFI, and
-            // telling every process the tablet is real hardware crashed backboardd on its first start three times (i1d2e5eab6), so
-            // only QuartzCore's answer is held at 0: the stored byte, then the token marked done, so the query never runs.
-            const int64_t onceDone = -1;
-            gpu->mark(writeTask(0x1e701bdd9 + slide, &off, sizeof off) && writeTask(0x1e7020780 + slide, &onceDone, sizeof onceDone) &&
-                      writeTask(0x1e701bdd9 + slide, &off, sizeof off) ? 0x6E04 : 0x6EF4);
-            if (nativeIsRenderServer() && bootArgSet("sheng-fb-bgra=1")) gpu->mark(patchFramebufferBranch(slide));
+            if (!strcmp(getprogname(), "backboardd") && bootArgSet("fb-bgra=1")) gpu->mark(patchFramebufferBranch(0x184461928 + slide));
             // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
             // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
             // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156), 0x10 the device-is-virtualized byte (0x1e701bdd9).
@@ -633,7 +488,7 @@ static id deviceForPort(unsigned port) {
             static uintptr_t gSlide;
             gSlide = slide;
             pthread_t reader;
-            if (nativeIsRenderServer() && pthread_create(&reader, nullptr, [](void *arg) -> void * {
+            if (!strcmp(getprogname(), "backboardd") && pthread_create(&reader, nullptr, [](void *arg) -> void * {
                 sleep(30);
                 const float headroom = *reinterpret_cast<volatile const float *>(0x1e7021014 + gSlide);
                 const float threshold = *reinterpret_cast<volatile const float *>(0x1e7021104 + gSlide);
@@ -655,20 +510,18 @@ static id deviceForPort(unsigned port) {
             }, gpu) == 0)
                 pthread_detach(reader);
         }
+#else
+        // macOS: the framebuffer format is changed as a fixup of signed text (the board's payload text_fixups), applied when the page
+        // passes code signing validation. A write into the mapped page from here made the page invalid, and code signing killed
+        // WindowServer at its next validation of that page.
 #endif  // !TARGET_OS_OSX
 #endif
-        // On an iPad the render server's queue runs at a high GPU priority (CoreAnimation asks for it with setGPUPriority: when it makes
-        // its MetalContext). A Vulkan queue's priority is fixed when the device opens, before that call, so the render server asks the
-        // runtime for it here (patches/metal2vulkan/0012): where the host offers priorities, its frames no longer wait on the GPU behind
-        // an app's.
-        setenv("METAL2VULKAN_QUEUE_PRIORITY", "high", 0);
-        boundPooledBlocks();
         // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums
-        // (sheng-diag=1).
-        if (getenv("SHENG_DIAG")) setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
+        // (diag=1).
+        unsetenv("METAL2VULKAN_LOG_PIPELINES");
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
-        char candidates[5][512] = {};
+        char candidates[7][512] = {};
         if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
         if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
         strlcpy(candidates[2], "/tmp/", sizeof candidates[2]);
@@ -681,17 +534,24 @@ static id deviceForPort(unsigned port) {
             mkdir(candidates[4], 0700);
             strlcat(candidates[4], "/", sizeof candidates[4]);
         }
-        static const unsigned order[] = {4, 0, 1, 2, 3};
+        strlcpy(candidates[5], sharedShaderCacheDirectory().c_str(), sizeof candidates[5]);
+#if TARGET_OS_OSX
+        // First the system shader cache's directory, where the kernel made it for this process (marker 0x6816): what the render
+        // server compiles and primes there, every process reads (SharedShaderCache.h). Not with gpu-prime-system=0.
+        if (!bootArgSet("gpu-prime-system=0")) strlcpy(candidates[6], systemcache::writerDirectory().c_str(), sizeof candidates[6]);
+#endif
+        static const unsigned order[] = {6, 5, 4, 0, 1, 2, 3};
         for (unsigned i : order) {
             if (device) break;
             if (!candidates[i][0]) continue;
-            strlcat(candidates[i], "m2v", sizeof candidates[i]);
-            mkdir(candidates[i], 0700);
+            if (i == 0) {strlcat(candidates[i], "com.apple.metal", sizeof candidates[i]); mkdir(candidates[i], 0700); strlcat(candidates[i], "/", sizeof candidates[i]);}   // as for the clients below
+            if (i < 5) strlcat(candidates[i], "m2v", sizeof candidates[i]);
+            if (i != 6) mkdir(candidates[i], 0700);
             if (access(candidates[i], W_OK) != 0) continue;
             // Files an earlier image's copying import left half written here (int 590aaee2), which hold memory of the Data disk.
             {
                 static bool once;
-                if (!once) {once = true; removeHalfImported(candidates[i]);}
+                if (!once && i < 5) {once = true; removeHalfImported(candidates[i]);}
             }
             // The image's pipeline pack (an earlier boot's export), into this directory before the runtime reads it. Marker 0x6Cnn: files written
             // (saturated at 0xfe), 0x6Cff the pack was refused.
@@ -699,12 +559,14 @@ static id deviceForPort(unsigned port) {
                 const int imported = cacheexport::importPack(pack, candidates[i]);
                 if (imported) gpu->mark(0x6C00 | (imported < 0 ? 0xff : imported > 0xfe ? 0xfe : imported));
             }
+            // What the device writes in the system cache's directory is readable by everyone; in any other, by this user alone.
+            native_bridge_metal_system_cache(nullptr, nullptr, 0, i == 6);
             @try {
                 device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
             } @catch (NSException *exception) {
                 device = nil;
             }
-            if (device) {gpu->mark(0x6810 + i); gCacheDirectory = candidates[i];}   // which directory served
+            if (device) {gpu->mark(0x6810 + i); gCacheDirectory = candidates[i]; gFillsSystemCache = i == 6;}   // which directory served
         }
         if (!device) {
             gpu->mark(0x68f2);
@@ -714,67 +576,17 @@ static id deviceForPort(unsigned port) {
             return nil;
         }
         gpu->mark(0x6802);
-        startMemoryWriter();
-        // The status line (GPU8) every ten seconds (sheng-diag=1), and the display hand-off client on its own thread: both only read or serve,
-        // neither is the discovery's.
-        pthread_t monitor, scanout;
+        // The display hand-off client on its own thread: it only serves, not the discovery.
+        pthread_t scanout;
         pthread_attr_t attributes;
         pthread_attr_init(&attributes);
         pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
         pthread_attr_setstacksize(&attributes, 1u << 20);
-        const bool diag = getenv("SHENG_DIAG") != nullptr;
-        if (diag) pthread_create(&monitor, &attributes, [](void *arg) -> void * {
-            Gpu *g = static_cast<Gpu *>(arg);
-            for (;;) {
-                sleep(10);
-                char status[64], text[64];
-                static unsigned phase;
-                // status (counters, then the last two refusals' texts), formats; the stream carries 63 characters per line, so a long status goes
-                // out in 57-character pieces on consecutive lines (the UFS log keeps every line).
-                char full[420];
-                native_bridge_metal_status(full, sizeof full);
-                const size_t length = strlen(full);
-                const unsigned pieces = (unsigned)((length + 56) / 57);
-                const unsigned step = phase++ % (1 + (pieces ? (pieces > 7 ? 7 : pieces) : 1));
-                if (step == 0) {
-                    native_bridge_metal_formats(status, sizeof status);
-                    snprintf(text, sizeof text, "PUB %.58s", status);
-                } else {
-                    snprintf(text, sizeof text, "ST%u %.57s", step - 1, full + (size_t)(step - 1) * 57);
-                }
-                streamText(*g, text);
-                reportDisplayState(*g);
-                g->mark(0x6A00 | gDiagBits);   // the diagnostics page lists the last few markers only
-            }
-            return nullptr;
-        }, gpu);
-        pthread_t telemetry;
-        if (diag) pthread_create(&telemetry, &attributes, [](void *arg) -> void * {
-            Gpu *g = static_cast<Gpu *>(arg);
-            sleep(5);
-            // The bridge's telemetry table, resent whole every four seconds as markers (two characters each): 0xC000|row starts a row of the
-            // kernel's table, 0x8000|(a<<7)|b appends two characters. Rows are at most 90 characters; 48 rows.
-            for (;;) {
-                static char table[6144];
-                native_bridge_metal_telemetry(table, sizeof table);
-                unsigned row = 0;
-                for (char *line = table; *line && row < 48;) {
-                    char *end = strchr(line, '\n');
-                    if (end) *end = 0;
-                    g->mark(0xC000u | row);
-                    const size_t length = strlen(line) < 90 ? strlen(line) : 90;
-                    for (size_t i = 0; i < length; i += 2) {
-                        const unsigned a = (unsigned char)line[i] & 0x7f, b = i + 1 < length ? (unsigned char)line[i + 1] & 0x7f : 0;
-                        g->mark(0x8000u | (a << 7) | b);
-                    }
-                    ++row;
-                    if (!end) break;
-                    line = end + 1;
-                }
-                sleep(6);
-            }
-            return nullptr;
-        }, gpu);
+        // The telemetry table with diag=1 (streamTelemetry); without it the thread does not exist.
+        if (getenv("SHENG_DIAG")) {
+            pthread_t telemetry;
+            pthread_create(&telemetry, &attributes, streamTelemetry, gpu);
+        }
         pthread_create(&scanout, &attributes, [](void *arg) -> void * {
             Gpu *g = static_cast<Gpu *>(arg);
             sleep(3);
@@ -802,15 +614,40 @@ static id deviceForPort(unsigned port) {
         pthread_attr_setstacksize(&attributes, 8u << 20);
         pthread_t primer;
         pthread_create(&primer, &attributes, [](void *) -> void * {
+                pthread_setname_np("native-metal-prime");   // a process sample and the telemetry's TH rows name its CPU time
                 char list[1024];
                 prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
-                           requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string());
+                           requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string(),
+                           gFillsSystemCache);
                 return nullptr;
             }, nullptr);
         pthread_attr_destroy(&attributes);
+        // The GMEM colour order test (NativeTurnipSwapTest.h), once, 20 s after the device is published: each result line goes to the
+        // kernel's GPU trace as a problem record (event 65).
+        if (bootArgSet("swaptest=1") && nativeIsRenderServer()) {
+            pthread_t tester;
+            pthread_create(&tester, nullptr, [](void *) -> void * {
+                    sleep(20);
+                    char path[1024];
+                    if (!turnip::libraryPath(path, sizeof path)) return nullptr;
+                    void *lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+                    auto send = lib ? reinterpret_cast<bool (*)(uint32_t, const void *, uint32_t)>(dlsym(lib, "tu_darwin_frame_diagnostic"))
+                                    : nullptr;
+                    turnip::swaptest::run(path, [&](const char *text) {
+                        if (!send) return;
+                        NativeGpuTraceRecord record = {};
+                        record.event = GpuTraceProblem;
+                        strlcpy(reinterpret_cast<char *>(&record.value[1]), text, 11 * sizeof(uint64_t));
+                        send(NativeGpuTraceMethod, &record, sizeof record);
+                    });
+                    return nullptr;
+                }, nullptr);
+            pthread_detach(tester);
+        }
         gpu->mark(0x6803);
 #if TARGET_OS_OSX
         iogpu::install(device, port);
+        quartzCoreBundleReport();
 #endif
         return device;
     }
@@ -821,7 +658,7 @@ static id deviceForPort(unsigned port) {
 - (id)initWithAcceleratorPort:(unsigned)port {
 #if TARGET_OS_OSX
     // The registered device is the frontend's object, not this one: IOGPUMetalDevice's own initializer would open an IOGPU user client.
-    // This object is kept, because -[IOGPUMetalDevice dealloc] tears down state its initializer never made (upstream bd09ede).
+    // This object is kept, because -[IOGPUMetalDevice dealloc] tears down state its initializer never made.
     static NSMutableArray *kept;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ kept = [NSMutableArray array]; });
@@ -874,3 +711,100 @@ static id deviceForPort(unsigned port) {
     return nil;
 }
 @end
+
+#if TARGET_OS_OSX
+#include <objc/runtime.h>
+#include <mach/mach_time.h>
+#include <atomic>
+// WindowServer's frame pacing, as macOS-DroidVM's plugin (24af265, kc253-kc292), each behind its boot argument.
+//
+// WindowServer's and WallpaperAerialsExtension's 4:2:0 YCbCr surface textures (video frames: the lock screen's Aerial wallpaper, a
+// 4096x2160 10-bit decoder pool, and the 4480x3088 RGB10_420_2P frames the extension converts itself) are read over their planes in
+// place (the frontend's ycbcrPlanesInPlace): no converted image and staging copy, about 100 MiB per 4K texture, and their surfaces
+// counted in use only while a command buffer reads them, so the decoder's pool gets them back (Droid-VM/macOS-DroidVM's P4).
+// /private/var/ngpu/debug/no-ycbcr-planes turns it off.
+__attribute__((constructor)) static void videoPlanesInPlace() {
+    if (strcmp(getprogname(), "WindowServer") && strcmp(getprogname(), "WallpaperAerialsExtension")) return;
+    if (access("/private/var/ngpu/debug/no-ycbcr-planes", F_OK) == 0) return;
+    setenv("METAL2VULKAN_YCBCR_PLANES_ONLY", "1", 0);
+}
+
+// ca-triple-buffer=1 sets QuartzCore's debug option CA_FORCE_TRIPLE_BUFFERED_LATENCY (read by IOMFBDisplay::can_update_):
+// CoreAnimation renders a frame ahead instead of starting each frame only after the last one's buffer came back, which it otherwise
+// does whenever a frame took longer than a refresh (DroidVM: a heavy window drag from 56-60 to 61-67 frames a second).
+__attribute__((constructor)) static void tripleBufferFromBootArgs() {
+    if (strcmp(getprogname(), "WindowServer") || !publish::bootArgSet("ca-triple-buffer=1")) return;
+    auto setOption = reinterpret_cast<void (*)(unsigned, bool)>(dlsym(RTLD_DEFAULT, "CASetDebugOption"));
+    auto optionName = reinterpret_cast<const char *(*)(unsigned)>(dlsym(RTLD_DEFAULT, "CAGetDebugOptionEnvVariableName"));
+    // The option's index differs between QuartzCore builds, so it is found by its name.
+    unsigned index = ~0u;
+    for (unsigned i = 0; optionName && i < 1024; ++i) {
+        const char *name = optionName(i);
+        if (!name) break;
+        if (!strcmp(name, "CA_FORCE_TRIPLE_BUFFERED_LATENCY")) { index = i; break; }
+    }
+    const bool set = setOption && index != ~0u;
+    if (set) setOption(index, true);
+    os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal: CA_FORCE_TRIPLE_BUFFERED_LATENCY %{public}s (option %u)", set ? "set" : "not found", index);
+}
+
+// ca-free-wakeup=1: SkyLight starts each WindowServer update at -[CAWindowServerDisplay nextWakeupTime], which QuartzCore puts on the
+// refresh grid (the last VBL plus a frame), so an update that took 13 ms is followed by one at 16.7 ms. This answers the earlier of that
+// and a refresh after the last update's start (-beginExternalUpdate:usingSoftwareRenderer:): the display shows a swap when it comes,
+// not at a VBL. SkyLight adds its updater delay (0.5 ms) and updates at once only when the last update is more than 1.25 frames before
+// the answer, so before the due time the answer is the due time less that delay, after it the least time 1.25 frames past the last
+// start. Without an update in the last second the grid's answer stands. The refresh is vsync='s (120 by default).
+// DroidVM: a heavy window drag from 60 to 96 frames a second.
+static std::atomic<uint64_t> gUpdateBegan{0}, gLastAsk{0};
+static double hostSeconds(uint64_t t) {
+    static mach_timebase_info_data_t base;
+    if (!base.denom) mach_timebase_info(&base);
+    return (double)t * base.numer / base.denom / 1e9;
+}
+static uint64_t hostTicks(double seconds) {
+    static mach_timebase_info_data_t base;
+    if (!base.denom) mach_timebase_info(&base);
+    return (uint64_t)(seconds * 1e9 * base.denom / base.numer);
+}
+__attribute__((constructor)) static void freeWakeupFromBootArgs() {
+    if (strcmp(getprogname(), "WindowServer") || !publish::bootArgSet("ca-free-wakeup=1")) return;
+    char args[1100] = {};
+    size_t size = sizeof args - 1;
+    unsigned hz = 120;
+    if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
+        if (const char *at = publish::bootArgToken(args, "vsync=")) {
+            const int value = atoi(at + 6);
+            if (value >= 30 && value <= 240) hz = (unsigned)value;
+        }
+    const double refresh = 1.0 / hz;
+    Class display = objc_getClass("CAWindowServerDisplay");
+    static SEL wakeSel = sel_registerName("nextWakeupTime"), beginSel = sel_registerName("beginExternalUpdate:usingSoftwareRenderer:");
+    Method wake = display ? class_getInstanceMethod(display, wakeSel) : nullptr;
+    Method begin = display ? class_getInstanceMethod(display, beginSel) : nullptr;
+    if (!wake || !begin || method_getTypeEncoding(wake)[0] != 'd' || method_getNumberOfArguments(begin) != 4) {
+        os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal: free wakeup: CAWindowServerDisplay lacks %{public}s",
+               !wake ? "nextWakeupTime" : "beginExternalUpdate:usingSoftwareRenderer:");
+        return;
+    }
+    static auto wakeGrid = reinterpret_cast<double (*)(id, SEL)>(method_getImplementation(wake));
+    static auto beginOriginal = reinterpret_cast<uint64_t (*)(id, SEL, void *, uint64_t)>(method_getImplementation(begin));
+    method_setImplementation(begin, imp_implementationWithBlock(^uint64_t(id self, void *update, uint64_t software) {
+        // The update's start is SkyLight's last ask before it, where its update callback began.
+        const uint64_t now = mach_absolute_time(), asked = gLastAsk.load(std::memory_order_relaxed);
+        gUpdateBegan.store(asked && now - asked < hostTicks(0.003) ? asked : now, std::memory_order_relaxed);
+        return beginOriginal(self, beginSel, update, software);
+    }));
+    method_setImplementation(wake, imp_implementationWithBlock(^double(id self) {
+        const double grid = wakeGrid(self, wakeSel);
+        gLastAsk.store(mach_absolute_time(), std::memory_order_relaxed);
+        const uint64_t began = gUpdateBegan.load(std::memory_order_relaxed);
+        if (grid <= 0 || !began) return grid;
+        const double now = hostSeconds(mach_absolute_time()), start = hostSeconds(began);
+        if (now - start > 1.0) return grid;
+        const double due = start + refresh - 0.0005, ahead = start + 1.25 * refresh + 0.001;
+        if (now < due) return due < grid ? due : grid;
+        return now > ahead ? now : ahead;
+    }));
+    os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal: free wakeup on (%.2f ms)", refresh * 1e3);
+}
+#endif

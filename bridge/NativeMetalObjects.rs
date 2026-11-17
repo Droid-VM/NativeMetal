@@ -411,8 +411,10 @@ fn guard<T>(fallback: T, body: impl FnOnce() -> Result<T, String>) -> T {
             set_error(why);
             fallback
         }
-        Err(_) => {
-            set_error("panic in the Metal runtime".into());
+        Err(payload) => {
+            let why = payload.downcast_ref::<String>().map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied()).unwrap_or("unknown panic payload");
+            set_error(format!("panic in the Metal runtime: {why}"));
             fallback
         }
     }
@@ -659,6 +661,10 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
         open_runtime_diagnostics(cache.to_string_lossy().as_ref());
         let device = Device::system_default_with(&options).map_err(e("device"))?;
+        if std::env::var("NATIVE_METAL_TILING_CHECK").as_deref() == Ok("1") {
+            let settled = device.settle_tiling_cost_check(std::time::Duration::from_secs(3));
+            eprintln!("native-metal tiling-check settled={settled}: {}", device.tiling_cost_check_report());
+        }
         write_runtime_policy(&device);
         // No caller moves or detaches the pages of a no-copy buffer (the frontend has no rebind or detach): the encoders log no calls
         // to encode again and hold no surface's buffer per command, which every frame of the render server paid for.
@@ -711,7 +717,6 @@ fn note_shadow(text: &str) {
 // NATIVE_METAL_WARNINGS=1: each kind of message (its id and the text's first 48 characters) the first time it comes, in full and
 // with its severity, to standard error, for the first 400 kinds. The telemetry keeps only the last warning, and a degradation that
 // draws nothing is otherwise silent.
-static COMMIT_TIMINGS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 const TIMING_LOG_LIMIT: usize = 512 * 1024;
 struct TimingLog { file: std::fs::File, bytes: usize }
 static TIMING_LOG: std::sync::OnceLock<std::sync::Mutex<TimingLog>> = std::sync::OnceLock::new();
@@ -738,9 +743,10 @@ fn diagnostic_stamp() -> String {
 fn write_runtime_policy(device: &Device) {
     let Some(path) = POLICY_LOG.get() else { return; };
     let profile = device.compile_device();
-    let text = format!("{}\npolicy={:#?}\nsubmit={}\nqueue-switch={}\nin-place={:#?}\nprofile={:#?}\n",
+    let text = format!("{}\npolicy={:#?}\nsubmit={}\nqueue-switch={}\nin-place={:#?}\ntiling-cost={}\nprofile={:#?}\n",
         diagnostic_stamp(), profile.policy(), device.submit_check_report(),
-        device.queue_switch_check_report(), device.in_place_check_report(), profile.profile());
+        device.queue_switch_check_report(), device.in_place_check_report(),
+        device.tiling_cost_check_report(), profile.profile());
     let text: String = text.chars().take(64 * 1024).collect();
     let _ = std::fs::write(path, text);
 }
@@ -927,12 +933,12 @@ pub extern "C" fn nmb_device_fast_path_counts(device: *const NmbDevice, out: *mu
             write_runtime_policy(device);
         }
         let w = device.work_counts();
-        out.fill(u64::MAX);
-        out[..6].copy_from_slice(&[w.grouped_submissions, w.batches_grouped, w.command_pools_made,
-                                  w.spare_command_pools_taken, w.linear_passes_in_place, w.linear_passes_through_copies]);
-        out[6] = 0;
-        out[7] = COMMIT_TIMINGS[0].load(std::sync::atomic::Ordering::Relaxed);
-        out[8] = COMMIT_TIMINGS[1].load(std::sync::atomic::Ordering::Relaxed) / 1000;
+        out.copy_from_slice(&[w.grouped_submissions, w.batches_grouped, w.command_pools_made,
+                              w.spare_command_pools_taken, w.linear_passes_in_place, w.linear_passes_through_copies,
+                              w.region_pipelines_evicted, w.commit_calls, w.commit_nanos / 1000,
+                              w.commit_lowering_nanos / 1000, w.commit_recording_nanos / 1000,
+                              w.commit_pipeline_wait_nanos / 1000, w.commit_lock_wait_nanos / 1000,
+                              w.commit_pass_nanos / 1000, w.commit_submit_nanos / 1000]);
         Ok(true)
     })
 }
@@ -3452,8 +3458,6 @@ pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffe
     });
     if let Some(began) = began {
         let nanos = began.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        COMMIT_TIMINGS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        COMMIT_TIMINGS[1].fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
         if nanos >= 8_000_000 {
             note_encoder_timing(&format!("command_buffer={command_buffer:p} commit_us={} accepted={result}", nanos / 1000));
         }

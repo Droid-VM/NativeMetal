@@ -2,6 +2,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include "ShaderCacheState.h"
+#include "ShaderCacheActivity.h"
 #include "../SharedShaderCache.h"
 #include "../PrimeShaders.h"
 #include <signal.h>
@@ -31,6 +32,16 @@ static void saveState(NSString *state, const std::string &library = {}, const st
     [value writeToFile:SCPath(@"shader-cache.plist") atomically:YES];
 }
 
+static void startState() {
+    NSDictionary *saved = [NSDictionary dictionaryWithContentsOfFile:SCPath(@"shader-cache.plist")];
+    if (![saved[@"build"] isEqual:SCInstalledBuild()]) {saveState(@"running"); return;}
+    NSMutableDictionary *state = saved.mutableCopy;
+    state[@"state"] = @"running";
+    state[@"updated"] = NSDate.date;
+    state[@"error"] = @"";
+    [state writeToFile:SCPath(@"shader-cache.plist") atomically:YES];
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         if (argc != 2 || (strcmp(argv[1], "--run") && strcmp(argv[1], "--stop"))) return 64;
@@ -47,7 +58,15 @@ int main(int argc, const char **argv) {
         unlink(SCPath(@"shader-cache.stop").fileSystemRepresentation);
         signal(SIGTERM, interruptWorker);
         signal(SIGINT, interruptWorker);
-        saveState(@"running");
+        SCCompilationActivity activity;
+        const IOReturn powerStatus = activity.begin();
+        if (powerStatus != kIOReturnSuccess) {
+            fprintf(stderr, "Shader Cache - power assertion creation failed - 0x%x\n", (unsigned)powerStatus);
+            saveState(@"failed", {}, {}, @"Could not prevent idle sleep during compilation");
+            return 71;
+        }
+        fprintf(stderr, "Shader Cache - preventing display and idle system sleep\n");
+        startState();
         setpriority(PRIO_PROCESS, 0, 10);
         setenv("NATIVE_METAL_PRIMER", "1", 1);
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -63,6 +82,8 @@ int main(int argc, const char **argv) {
         };
         prime::run(device, SCStorage.fileSystemRepresentation, 0,
                    "/Library/GPUBundles/NativeAdrenoMetal.primelist", true);
+        activity.end();
+        fprintf(stderr, "Shader Cache - restored normal idle sleep policy\n");
         saveState(prime::stopping() ? @"stopped" : native_prime_pass_complete == 1 ? @"complete" : @"incomplete");
         unlink(SCPath(@"shader-cache.stop").fileSystemRepresentation);
         close(lock);

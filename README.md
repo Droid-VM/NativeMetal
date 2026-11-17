@@ -2,9 +2,9 @@
 
 Metal frontend through metal2vulkan and Turnip.
 
-The runtime uses the complete metal2vulkan `development` tree at `555b13d57e09bff70996a88cff64f1275256d5cf`, with the recorded consumer patch. A740 uses native float operations and RelaxedPrecision for eligible half instructions; float controls and PrecisionNote retain the device's precision bounds. Turnip enables concurrent binning and built-in fast border colors. `tu-cb=0` and `tu-fbc=0` select their diagnostic controls.
+The runtime uses the complete metal2vulkan `development` revision selected in UniXNU's `scripts/data/gpu-metal-vulkan-inputs.json`, with the consumer patch selected by `scripts/build-adreno-metal-bridge.py`. A740 uses native float operations and RelaxedPrecision for eligible half instructions; float controls and PrecisionNote retain the device's precision bounds. Turnip enables concurrent binning and built-in fast border colors. `tu-cb=0` and `tu-fbc=0` select their diagnostic controls.
 
-From the resolved UniXNU tree, `python3 drivers/AdrenoMetal/tools/audit-runtime-fast-paths.py --fetch-mesa --output build/runtime-fast-paths.json` reports the source policy fields, float controls, accuracy ledger and pinned Turnip option registry. `--runtime-policy <runtime-policy.log>` attaches a captured device profile and runtime checks. Math operations follow upstream `Math::float_stems()`, `BinOp::ALL` and `PrecisionNote`, with their existing validation.
+From the resolved UniXNU tree, `python3 drivers/AdrenoMetal/tools/audit-runtime-fast-paths.py --fetch-mesa --output build/runtime-fast-paths.json` reports the source policy fields, float controls, accuracy ledger and pinned Turnip option registry. `--runtime-policy <runtime-policy.log>` attaches a captured device profile and runtime checks. Available arithmetic gates are reported for the selected source revision. Math operations follow upstream `Math::float_stems()`, `BinOp::ALL` and `PrecisionNote`, with their existing validation.
 
 The frontend uses metal2vulkan and Turnip with the kernel GPU interface and selected OS ABI. GPU composition has been verified on sheng with A740.
 
@@ -60,9 +60,15 @@ Function reflection exposes vertex and stage-input attributes with their indices
 
 Each process keeps its pipeline cache in the first directory its sandbox lets it write: the same-user shared directory, then Metal's own cache directory. Compiler replies for source and stitched libraries are kept beside it. A cache entry's access time is refreshed on a hit until the platform refuses the change once.
 
-On macOS, Shader Cache displays library progress, compiled functions, failures and missing inputs. Start requests compilation through an administrator-authorized worker; Stop finishes the current compilation and saves progress. Starting again retains successful checkpoints and retries failed entries. The app is installed at `/Library/GPUBundles/Shader Cache.app`, with an Applications entry in the sheng lab. Its `--status` argument prints the current state as JSON.
+System cache readers reconstruct chunked records through the same owner, permissions and link checks used for whole records. Chunk files retain the shared cache directory permissions.
+
+On macOS, Shader Cache displays library progress, compiled functions, failures and missing inputs. Start requests compilation through an administrator-authorized worker; Stop finishes the current compilation and saves progress. Starting again retains successful checkpoints and retries failed entries. The macOS addon installs the app at `/Applications/Shader Cache.app`. A login agent registers it with LaunchServices for each Aqua session so it appears in Launchpad. Registration does not start shader compilation. Its `--status` argument prints the current state as JSON.
 
 On iPadOS, the render server compiles the inventory while idle. The build embeds the OS library inventory, and `prime.log` records the build, scope and completion result.
+
+### Compilation power assertions
+
+The macOS worker prevents automatic display and system sleep while compiling and releases both assertions when the task completes, stops or fails. Closing the app leaves protection with the running worker.
 
 ### System shader cache (macOS)
 

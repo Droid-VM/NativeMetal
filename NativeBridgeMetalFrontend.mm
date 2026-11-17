@@ -6582,6 +6582,15 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gMissing=missing;gInFlight=[NSMutableSet set];
  nmb_set_panic_note([](const char *what){NBLOG(@"native-metal: %s",what);});
  if(cache && *cache){configureShaderDiskCache(cache);gCacheRoot=cache;}
+ const bool renderStderr=diagOn() && nativeIsRenderServer();
+ if(diagOn() && !gCacheRoot.empty() && (renderStderr || (getenv("NATIVE_METAL_DUMP_CB") && !strcmp(getprogname(),"iconservicesagent")))) {
+  const std::string path=gCacheRoot+"/runtime-stderr.log";
+  const int fd=open(path.c_str(),O_WRONLY|O_CREAT|(renderStderr?O_APPEND:O_TRUNC)|O_CLOEXEC|O_NOFOLLOW,0600);
+  if(fd>=0) {
+   dprintf(fd,"native-metal runtime stderr boot=%s pid=%d\n",getenv("NATIVE_METAL_BOOT_SESSION")?:"unknown",getpid());
+   if(fd!=STDERR_FILENO){dup2(fd,STDERR_FILENO);close(fd);}
+  }
+ }
  gDevice=nmb_device_open(loader,cache);
  if(loader)gLoaderPath=loader;
  if(diagOn() && loader) {

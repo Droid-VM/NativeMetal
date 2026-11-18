@@ -659,9 +659,6 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
         options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
         let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
-        // So is every no-copy buffer the runtime made over a copy of its pages, with why it imported none (`copied.log`).
-        options.announce_each.insert(metal2vulkan_runtime::Degradation::CopiedHostPages);
-        let _ = COPIED_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("copied.log"));
         open_runtime_diagnostics(cache.to_string_lossy().as_ref());
         let device = Device::system_default_with(&options).map_err(e("device"))?;
         if std::env::var("NATIVE_METAL_TILING_CHECK").as_deref() == Ok("1") {
@@ -702,22 +699,14 @@ static SHADOW_LOG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 static SHADOW_SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 const SHADOW_REASONS: usize = 64;
 
-// The same for the reasons no-copy buffers were made over copies of their pages (copied.log).
-static COPIED_LOG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-static COPIED_SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
 fn note_shadow(text: &str) {
-    note_reason(&SHADOW_LOG, &SHADOW_SEEN, text);
-}
-
-fn note_reason(log: &std::sync::OnceLock<PathBuf>, seen: &std::sync::Mutex<Vec<String>>, text: &str) {
     let masked: String = text.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
-    let Ok(mut seen) = seen.lock() else { return };
+    let Ok(mut seen) = SHADOW_SEEN.lock() else { return };
     if seen.len() >= SHADOW_REASONS || seen.contains(&masked) {
         return;
     }
     seen.push(masked);
-    if let Some(path) = log.get() {
+    if let Some(path) = SHADOW_LOG.get() {
         use std::io::Write;
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(file, "{text}");
@@ -793,11 +782,8 @@ fn log_message(message: &DebugMessage) {
 fn observe_message(message: &DebugMessage) {
     use std::sync::atomic::Ordering::Relaxed;
     if message.id_name == "metal2vulkan-encoder-times" { note_encoder_timing(&message.text); }
-    if message.id_name.ends_with("-shadowed-texture") {
+    if message.id_name.ends_with("-shadowed-texture") {   // the runtime prefixes its degradations' ids (metal2vulkan-degrade-)
         note_shadow(&message.text);
-    }
-    if message.id_name.ends_with("-copied-host-pages") {
-        note_reason(&COPIED_LOG, &COPIED_SEEN, &message.text);
     }
     if message.id_name == "metal2vulkan-pipeline-creation" {
         let made = millis_after(&message.text, " made in ");
